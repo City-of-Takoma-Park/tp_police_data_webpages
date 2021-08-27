@@ -1,0 +1,13 @@
+name: tp_arrests_dashboard
+title: tp_arrests_dashboard
+username:
+account: takomapark
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 4548600
+bundleId: 4972087
+url: https://takomapark.shinyapps.io/tp_arrests_dashboard/
+when: 1630079164.58838
+lastSyncTime: 1630079164.58838
+asMultiple: FALSE
+asStatic: FALSE

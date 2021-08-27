@@ -1,0 +1,2257 @@
+---
+title: "Takoma Park Police Arrest Data Analysis"
+date: "August 13, 2021"
+output:
+    # word_document:
+  bookdown::html_document2:
+      toc: yes
+      toc_depth: 4
+      fig_width: 8
+      fig_height: 5
+      fig_caption: yes
+---
+
+<style type="text/css">
+h1 { /* Header 1 */
+  font-weight: bold
+}
+
+
+h2 { /* Header 2 */
+  font-style: italic
+}
+
+<!-- p { /* paragraph */ -->
+<!--   margin-bottom: 12px -->
+<!-- } -->
+
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(tidyverse)
+# library(conflicted)
+library(plotly)
+library(rlang)
+library(tidycensus)
+
+# internal packages
+library(tpfuncts)
+library(acsprocess)
+library(arrprocess)
+
+
+# define directory location for data
+content_dir <- "./data/"
+
+dfs_list <- c()
+
+# function to add dfs to list of dfs
+list_pop <- function(df,
+                     df_name, 
+                     new_names, 
+                     pct_cols) {
+  
+  # round numeric columns
+  df <- df %>%
+    ungroup %>%
+    mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+  # if didn't supply as many new column names as in dataframe - return error
+  if (length(new_names) != length(colnames(df))){
+    stop("Error; new names not equal to number of column names in old df")
+  }
+  
+  # set names of dataframe to list of supplied names
+  colnames(df) <- new_names
+  
+  # create a temporary list to store the dataframe and its name
+  temp_list <-  list(df) %>%
+    `names<-`(df_name)
+  
+  # combine the new list into the old list so populated with each addition
+  dfs_list <<- c(dfs_list, temp_list)
+
+}
+
+# read in 2019 acs data - processed as part hced analysis
+race_demog <- readRDS(data_path("acs/race_ethn_processed.rds"))
+
+# read in data
+traffic_processed <- readRDS(data_path("tp_police/traffic_processed.rds"))
+
+crime_processed <- readRDS(data_path("tp_police/crime_processed.rds"))
+
+all_processed <- readRDS(data_path("tp_police/all_arrests_final.rds"))
+
+# process tp race demographic info to align with policing data
+race_demog <- race_demog %>%
+  # filter out white inc. hispanic
+  filter(!grepl("^White alone", race_ethnicity)) %>%
+  # recode race to align with police department racial categories
+  mutate(race = race_lookup(race_ethnicity)) %>%
+  # calculate race totals/percent of pop by race
+  group_by(race, pop_total) %>%
+  summarize(population = sum(estimate),
+            pct_pop = pct_round(population, pop_total)) %>%
+  distinct()
+
+# fiilter out races not appearing in internal officer-level racial categories
+race_pop_policemerge <- race_demog %>%
+  filter(!race %in% c("Other", "Native American"))
+
+# function to order offense-types in consistent order based on what offenses present in dataset
+type_desc_prep <- function (df, type_col = "type_desc"){
+  
+  # pull all offense type-descriptions
+  unique_all <- all_processed$type_desc %>% 
+    unique %>% 
+    sort
+  
+  # pull traffic type descriptions
+  type_vector_order <- all_processed %>%
+    filter(overall_type == "Traffic") %>%
+    pull(type_desc) %>%
+    unique() %>%
+    sort()
+  
+  # order traffic type descriptions first in order of all offense types
+  type_vector_order <- unique(c(type_vector_order, unique_all))
+  
+  # pull unique types appearing in dataset working with
+  type_vector <- df[[type_col]] %>% unique()
+  
+  # if there are offense-types in data working with that aren't in vector of all types, return error
+  if (!all(type_vector %in% type_vector_order)) {
+    stop("Error; some type values not found in ordered type vector; re-define ordered type vector to capture all")
+  }
+  
+  # identify  types that appear in dataset in appropriate order
+  type_present <- type_vector_order[type_vector_order %in% 
+                                      type_vector]
+  
+  # create factor of type column based on what's present in dataset
+  df <- df %>% dplyr::mutate(`:=`(!!dplyr::sym(type_col), 
+                                  factor(!!dplyr::sym(type_col), type_present, type_present)))
+  return(df)
+}
+
+# function to order offenses in consistent order based on what offenses present in dataset
+offense_prep <- function  (df, offense_col = "offense"){
+  
+  # identify all unique offenses in data and sort
+  unique_all <- all_processed$offense %>% 
+    unique %>% 
+    sort
+  
+  # identify offenses in traffic data
+  type_vector_order <- all_processed %>%
+    filter(overall_type == "Traffic") %>%
+    pull(offense) %>%
+    unique() %>%
+    sort()
+  
+  # order offenses so traffic offenses first
+  type_vector_order <- unique(c(type_vector_order, unique_all))
+  
+  # return error if offenses in df not present in list of all offenses
+  type_vector <- df[[offense_col]] %>% unique()
+  
+  if (!all(type_vector %in% type_vector_order)) {
+    stop("Error; some race values not found in ordered race vector; re-define ordered race vector to capture all")
+  }
+  
+  # order offense-types present in dataset
+  type_present <- type_vector_order[type_vector_order %in% 
+                                      type_vector]
+  
+  # create factor ordering offenses by type
+  df <- df %>% dplyr::mutate(`:=`(!!dplyr::sym(offense_col), 
+                                  factor(!!dplyr::sym(offense_col), type_present, type_present)))
+  return(df)
+}
+
+
+# function to filter based on ward to tp residents only - because "city" field includes address of tp, which extends beyond city boundaries
+tp_filter <- function(df){
+  df %>%
+    filter(!a.ward %in% c("OOC", "UNK"))
+}
+
+# pull number of arrests
+pull_num_arrcit <- nrow(all_processed)
+
+# tp arrests by race
+race_tp_notooc <- all_processed %>%
+  # filter to arrests of takoma park residents
+  tp_filter() %>%
+  group_by() %>%
+  # calculate all arrests
+  mutate(total = n()) %>%
+  # calculate arrests by race
+  group_by(a.race, total) %>%
+  summarize(race_total = n(),
+         pct_race = pct_round(race_total, total)) %>%
+  distinct %>%
+  # join demographic data
+  left_join(race_pop_policemerge, by = c("a.race" = "race"))
+
+# add to list of summary dataframes
+list_pop(race_tp_notooc, df_name = "TP residents by race", new_names = c("Race", "City arrests", "Race arrests", "Race-arrests percent of city", "TP population overall", "TP race population", "Percent race population"))
+
+# pivot so arrests/population in the same column
+race_tp_notooc_pivot <- race_tp_notooc %>% 
+  pivot_longer(cols = c("pct_race", "pct_pop", "race_total", "population")) %>%
+  mutate(source = ifelse(grepl("pop", name), 
+                         "Population", "Arrests"),
+         name = ifelse(grepl("pct", name), "pct", "num")) %>%
+  pivot_wider(id_cols = c("a.race", "source"), "name")
+
+
+#### data checks - unique values, range of dates
+## confirms all arrest data unique - 
+if (!length(unique(all_processed$unique_id)) == nrow(all_processed)){
+  stop("error; mismatch in number of arrest ids and data rows; all arrest ids should be unique, suggesting ids repeat")
+}
+
+
+```
+
+
+```{r city type}
+
+# calculate arrest totals by city for traffic and non-traffic arrests, and calculate city totals/percents out of all arrests regardless of types
+city_type <- summarizer(all_processed, 
+                        c("overall_type",
+                          "a.city"), 
+                        output_prefixs = c("type", "city")) %>%
+  ungroup %>%
+  select(a.city, overall_type, total_num, type_num, type_pct, type_city_num, type_city_pct) %>%
+  group_by(a.city) %>%
+  mutate(city_total = sum(type_city_num),
+         city_pct = pct_round(city_total, total_num))
+
+# calculate number of arrests in unincorporated areas in takoma park
+ooc <- all_processed %>%
+  filter(grepl("unincorporated", a.city)) %>%
+  nrow()
+
+# add to list of summary datasets
+list_pop(city_type, "Arrests by arrestee city and type", c("City", "Type", "Total arrests", "Type total", "Type percent of all", "Type/city total", "Type/city percent of type", "City total", "City percent of all"))
+
+# recode city as other if less than 10%, and calculate updated percents
+city_type <- city_type %>%
+  mutate(a.city = ifelse(city_pct >= 10, a.city, "Other")) %>%
+  group_by(a.city, overall_type, total_num) %>%
+  summarize(type_city_num = sum(type_city_num),
+            type_city_pct = sum(type_city_pct))
+
+# create function to pull types of incidents for each city and pull crime/traffic for Takoma park
+pull_city_type <- pull_creator(city_type, 
+                               c("a.city", 
+                                 "overall_type"))
+
+pull_tp_crim_pct <- pull_city_type(c("Takoma", "Crime"), "type_city_pct")
+
+pull_tp_traffic_pct <- pull_city_type(c("Takoma", "Traffic"), "type_city_pct")
+
+
+```
+
+```{r county}
+
+# calculate total arrests by county regardless of type and arrange
+county <- all_processed %>%
+  group_by() %>%
+  mutate(total_arrests = n()) %>%
+  group_by(a.county, total_arrests) %>%
+  summarize(county_arrests = n(),
+            pct_arrest = pct_round(county_arrests, total_arrests)) %>%
+  arrange(desc(county_arrests)) %>%
+  distinct()
+
+# pull baltimore county's arrest percentage
+pull_county_nextbiggest <- county %>%
+  filter(grepl("Baltimore", a.county)) %>%
+  pull(pct_arrest)
+
+# pull number of unknown counties
+pull_num_unknown_county <- county %>%
+  filter(grepl("UNK", a.county)) %>%
+  pull(pct_arrest)
+
+# add to list of summary datasets
+list_pop(county, "Arrestee county", c("Arrestee county", "Total arrests", "County arrests", "County percent of all"))
+
+
+# create function to pull values by county
+pull_county <- pull_creator(county, "a.county")
+
+pull_oos_arrcit <- pull_county("OOS", "pct_arrest")
+
+# recode county as takoma park if city is takoma park and calculate percentages
+county <- all_processed %>%
+  mutate(a.county = ifelse(grepl("Takoma", a.city), "Takoma Park (MC)", a.county)) %>%
+  # filter out unknown counties
+  filter(!grepl("UNK", a.county)) %>%
+  group_by() %>%
+  # calculate total arrests and by county
+  mutate(total_arrests = n()) %>%
+  group_by(a.county, total_arrests) %>%
+  summarize(county_arrests = n(),
+            pct_arrest = pct_round(county_arrests, total_arrests)) %>%
+  arrange(desc(county_arrests)) %>%
+  distinct() %>%
+  # recode counties as other if 5 or less percent of arrests
+  mutate(a.county = ifelse(pct_arrest > 5, a.county, "Other")) %>%
+  group_by(a.county) %>%
+  summarize(county_arrests = sum(county_arrests),
+            pct_arrest = pct_round(county_arrests, total_arrests)) %>%
+  distinct()
+
+# function to pull values for counties
+pull_county <- pull_creator(county, "a.county")
+
+pull_othercounty_pct <- pull_county("Other", "pct_arrest")
+
+pull_mont_arrcit <- pull_county("Montgomery", "pct_arrest")
+
+pull_tp_county_arrcit <- pull_county("Takoma", "pct_arrest")
+
+pull_pg_arrcit <- pull_county("Prince Ge", "pct_arrest")
+
+pull_dc_arrcit <- pull_county("DC", "pct_arrest")
+
+# pull_oos_arrcit <- pull_county("OOS", "pct_arrest")
+
+# calculate out-of-state percentages
+state <- all_processed %>%
+  filter(!a.state %in% c("MD", "UNK")) %>%
+  group_by() %>%
+  mutate(total_arrests = n()) %>%
+  group_by(a.state, total_arrests) %>%
+  summarize(state_arrests = n(),
+            pct_arrest = pct_round(state_arrests, total_arrests)) %>%
+  arrange(desc(state_arrests)) %>%
+  distinct()
+
+# pull values for dc
+pull_state <- pull_creator(state, "a.state")
+
+pull_dc <- pull_state("DC", "pct_arrest")
+
+```
+
+
+```{r initiation}
+
+# calculate values by type and initiation
+initiated <- summarizer(all_processed, c("overall_type", "initiated"), c("type", "init")) %>%
+  select(overall_type, initiated, total_num, type_num, type_pct, type_init_num, type_init_pct)
+
+# add to list summary dataframes
+list_pop(initiated, "Initiation", c("Type", "Initiated", "Total arrests", "Type total", "Type percent of all", "Type/initiated total", "Type/initiated percent of type"))
+
+# function to pull values
+pull_initiated <- pull_creator(initiated, c("overall_type", "initiated"))
+
+pull_crim_public <- pull_initiated(c("Crime", "Public"), "type_init_pct")
+
+pull_traffic_officer <- pull_initiated(c("Traffic", "Officer"), "type_init_pct")
+
+
+```
+
+
+```{r type granular}
+
+# calculate values by granular type description
+type_spec <- summarizer(all_processed, c("overall_type", "type_desc"), c("type", "desc")) %>%
+  select(overall_type, type_desc, total_num, type_num, type_pct, type_desc_num, type_desc_pct)
+
+# add to list of summary dataframes
+list_pop(type_spec, "Specific-type", c("Overall category", "Type", "Total arrests", "Category total", "Category percent of all", "Category/type total", "Category/type percent of category"))
+
+# function to pull spec type values
+pull_type_spec <- pull_creator(type_spec, c("overall_type", "type_desc"))
+
+pull_crim_typarrests_pct <- pull_type_spec(c("Crime", "^Arrest$"), "type_desc_pct")
+
+pull_crim_typwarrant_pct <- pull_type_spec(c("Crime", "Warrant"), "type_desc_pct")
+
+pull_traffic_typarrests_pct <- pull_type_spec(c("Traffic", "^Arrest$"), "type_desc_pct")
+
+pull_traffic_typwarrant_pct <- pull_type_spec(c("Traffic", "Warrant"), "type_desc_pct")
+
+
+```
+
+
+```{r total arrests by type}
+
+# calculate arrests by overall type
+arrest_type_data_overall <- all_processed %>%
+  group_by() %>%
+  mutate(total= n()) %>%
+  ungroup() %>%
+  group_by(overall_type, total) %>%
+  summarize(arrests_type = n(),
+            pct_arrests = pct_round(arrests_type, total)) %>%
+  distinct()
+
+# add to list of summary datasets
+list_pop(arrest_type_data_overall, df_name = "Arrest type", new_names = c("Arrest type", "Total arrests", "Type total", "Type percent of all"), dfs_list)
+
+# function to pull values by overall type
+pull_arresttype <- pull_creator(arrest_type_data_overall, filter_col = c("overall_type"))
+
+pull_crim_pct <- pull_arresttype("Crime", "pct_arrests")
+
+pull_traffic_pct <- pull_arresttype("Traffic", "pct_arrests")
+
+```
+
+```{r offense}
+
+# identify unique offenses
+offense_vec <- all_processed$offense %>% unique %>% sort
+
+# calculate offenses by criminal/traffic type of arrest, and order offenses alphabetically
+offense <- summarizer(all_processed, 
+                      c("overall_type", "offense"), 
+                      c("typ", "off")) %>%
+  mutate(offense = factor(offense, offense_vec, offense_vec)) %>%
+  select(overall_type, offense, total_num, typ_num, typ_pct, typ_off_num, typ_off_pct)
+
+# add to list of summary datasets
+list_pop(offense, "Offense", c("Type", "Offense", "Total arrests", "Type total", "Type percent of all", "Type/offense total", "Type/offense percent of type"))
+
+# function to pull values on percent of offenses of a given type
+pull_offense <- pull_creator(offense, c("overall_type", "offense"))
+
+# pull control dangerous substances - sum percents because multiple values
+pull_cds <- pull_offense(c("Crime", "cds"), "typ_off_pct") %>%
+  sum()
+
+pull_crim_warrant_pct <- pull_offense(c("Crime", "Warrant"), "typ_off_pct")
+
+pull_crim_disorder_pct <- pull_offense(c("Crime", "Disorderly"), 'typ_off_pct')
+
+pull_traffic_dui_pct <- pull_offense(c("Traffic", "DUI"), "typ_off_pct")
+
+pull_traffic_warrant_pct <- pull_offense(c("Traffic", "Warrant"), "typ_off_pct")
+
+
+```
+
+
+```{r initiated over time}
+
+# calculate initiated over time by type of arrest
+initiated_year <- summarizer(all_processed, c("year", "overall_type", "initiated"), c("year", "typ", "init")) %>%
+  select(year, overall_type, initiated, total_num, year_num, year_pct, year_typ_num, year_typ_pct, year_typ_init_num, year_typ_init_pct)
+
+# add to list of summary dataframes
+list_pop(initiated_year, "Initiated by year", c("Year", "Type", "Initiatied", "Total arrests", "Year total", "Year percent of all", "Year/type total", "Year/type percent of year", "Year/type/initiation total", "Year/type/initiation percent of year/type"))
+
+# function to pull by year/type/initation
+pull_initiated_year <- pull_creator(initiated_year, c("year", "overall_type", "initiated"))
+
+
+pull_crim_public_2020 <- pull_initiated_year(c(2020, "Crime", "public"), "year_typ_init_pct")
+
+```
+
+
+```{r ward}
+
+# filter to data with a ward identifier - and calculate all arrests regardless type by ward
+ward <- summarizer(all_processed %>%
+                     filter(grepl("Ward", a.ward)), c("a.ward"), c("ward"))
+
+# add to list of summary dataframes
+list_pop(ward, "TP residents by Ward", c("Ward", "City total", "Ward total", "Ward percent of city"))
+
+# function to pull values by ward
+pull_ward <- pull_creator(ward, "a.ward")
+
+pull_ward6 <- pull_ward("Ward 6", "ward_pct")
+
+pull_ward5 <- pull_ward("Ward 5", "ward_pct")
+
+pull_ward56 <- pull_ward5 + pull_ward6
+
+pull_ward1 <- pull_ward("Ward 1", "ward_pct")
+
+```
+
+
+```{r race arrests}
+# arrests by race regardless type
+race_all <- all_processed %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(a.race, total) %>%
+  summarize(race_total = n(),
+            pct_race = pct_round(race_total, total)) %>%
+  distinct
+
+# add to list summary dataframes
+list_pop(race_all, "Race overall", c("Race", "Total arrests", "Race total", "Race percent of all"))
+
+# function to pull arrests by race
+pull_race <- pull_creator(race_all, "a.race")
+
+
+pull_black_arrcit_pct <- pull_race("Black", "pct_race")
+pull_hisp_arrcit_pct <- pull_race("Hispanic", "pct_race")
+pull_white_arrcit_pct <- pull_race("White", 'pct_race')
+
+```
+
+
+```{r race type overall}
+
+# calculate totals by race and type
+race_type <- all_processed %>%
+  group_by(overall_type) %>%
+  mutate(total = n()) %>%
+  group_by(overall_type, a.race, total) %>%
+  summarize(race_total = n(),
+            pct_race = pct_round(race_total, total)) %>%
+  distinct %>%
+  race_prep(race_col = "a.race")
+
+# summary datfarme
+list_pop(race_type, df_name = "Race by type", new_names = c("Type", "Race", "Type arrests", "Type/race arrests", "Type/race percent of type"))
+
+# function to pull values by race
+pull_race_type <- pull_creator(race_type, c("overall_type", "a.race"))
+
+pull_black_typcrime <- pull_race_type(c("Crime", "Black"), "pct_race")
+
+pull_black_typtraffic <- pull_race_type(c("Traffic", "Black"), "pct_race")
+
+pull_hispanic_typcrime <- pull_race_type(c("Crime", "hispanic"), "pct_race")
+
+pull_hispanic_typtraffic <- pull_race_type(c("Traffic", "hispanic"), "pct_race")
+
+pull_white_typcrime <- pull_race_type(c("Crime", "white"), "pct_race")
+
+pull_white_typtraffic <- pull_race_type(c("Traffic", "white"), "pct_race")
+
+
+```
+
+
+```{r race arrests over time}
+
+# arrests by year regardless of type
+arrests_year <- summarizer(all_processed, c("year", "a.race"), c("year", "race")) %>%
+  race_prep(race_col = "a.race")
+
+# add to list of summary dataframes
+list_pop(arrests_year, df_name = "Race by year", new_names = c("Year", "Race", "Year total", "Overall arrests", "Year percent of all", "Year/race total", "Year/race percent of year"))
+
+# function to pull arrests by race and year
+pull_year_race <- pull_creator(arrests_year, c("year", "a.race"))
+
+# 
+pull_2015_black_num <- pull_year_race(c(2015, "Black"), "year_race_num")
+
+pull_2017_black_num <- pull_year_race(c(2017, "Black"), "year_race_num")
+
+pull_2020_black_num <- pull_year_race(c(2020, "Black"), "year_race_num")
+
+pull_2015_black_pct <- pull_year_race(c(2015, "Black"), "year_race_pct")
+
+pull_2020_black_pct <- pull_year_race(c(2020, "Black"), "year_race_pct")
+
+
+pull_2015_hispanic_num <- pull_year_race(c(2015, "hispanic"), "year_race_num")
+
+pull_2020_hispanic_num <- pull_year_race(c(2020, "hispanic"), "year_race_num")
+
+pull_2015_hispanic_pct <- pull_year_race(c(2015, "hispanic"), "year_race_pct")
+
+pull_2020_hispanic_pct <- pull_year_race(c(2020, "hispanic"), "year_race_pct")
+
+pull_2015_white_num <- pull_year_race(c(2015, "white"), "year_race_num")
+
+pull_2020_white_num <- pull_year_race(c(2020, "white"), "year_race_num")
+
+pull_2015_white_pct <- pull_year_race(c(2015, "white"), "year_race_pct")
+
+pull_2020_white_pct <- pull_year_race(c(2020, "white"), "year_race_pct")
+
+
+```
+
+# Introduction
+
+Between 2015 and 2020, the City of Takoma Park's Police Department had `r pull_num_arrcit %>% commafy` recorded encounters in which officers arrested someone or issued them a criminal citation. 
+
+The data here includes two types of arrests made by Takoma Park Police officers. The criminal and traffic offenses that lead to the arrests are varied. The data includes criminal citations and arrests, and traffic stops leading to an arrest.
+
+The Police Department prepared these datasets by reviewing all reports involving arrests from 2015 to 2020, as well as judicial records associated with these arrests.
+
+The Police Department also participates in the Uniform Crime Reporting Program--a [national program maintained by the FBI](https://www.fbi.gov/services/cjis/ucr) to collect standardized data from local police departments around the country--and has reported UCR data in its annual reports through 2020.
+
+Comparing UCR data and the dataset prepared by the Police Department shows some differences. This is because of:
+
+1) *Differences in what types of arrests are reported as part of the UCR.* For instance, warrant-service arrests for cities other than Takoma Park and traffic arrests (other than DUIs) are not reported to the UCR but included in this dataset.
+
+2) *Changes in how the Department reported data as part of the UCR program.* Prior to 2018, the Department did not report civil citations as part of the UCR.
+
+This data is organized into three sections:
+
+1) *An overall analysis, of data on criminal and traffic arrests*
+
+2) *A race-disaggregated analysis of criminal and traffic arrests*
+
+3) *A race-disaggregated analysis of criminal and traffic arrests of Takoma Park residents.* This includes population data from the Census's 2015-2019 American Community Survey. 
+
+Key findings include:
+
+***Overall:***
+
+1) **Total arrests have declined significantly since 2015**, both traffic and criminal.
+
+2) **Residents of Takoma Park represent `r pull_tp_crim_pct`% of criminal arrests and `r pull_tp_traffic_pct`% of traffic arrests.** All but `r pull_othercounty_pct`% of other arrests were of residents of Prince George's County, Montgomery County other than Takoma Park, and DC.
+
+3) **Among Takoma Park residents, `r pull_ward56`% of police arrests were of Ward 5 and 6 residents.**
+
+4) **Based on officer coding of how arrests were initiated, `r pull_crim_public`% of criminal arrests were public initiated and `r pull_traffic_officer`% of traffic arrests officer-initiated.** The share of officer-initiated criminal arrests has declined since 2015.
+
+5) **By specific type, the most common arrests were full-custody arrests, representing `r pull_crim_typarrests_pct`% of criminal arrests and `r pull_traffic_typarrests_pct`% of traffic arrests.** Warrant-service arrests were second most common, followed by criminal citations.
+
+6) **Criminal-arrest offenses were fairly evenly distributed**, with the most common for warrant service at `r pull_crim_warrant_pct`% and disorderly conduct offenses at `r pull_crim_disorder_pct`%. **`r pull_traffic_dui_pct`% of traffic arrests were for DUI offenses and `r pull_traffic_warrant_pct`% for warrant-service**, with the rest more evenly distributed.
+
+***By race:***
+
+1) **Black people represented `r pull_black_arrcit_pct`% of all arrests, and Hispanic people `r pull_hisp_arrcit_pct`%, compared to `r pull_white_arrcit_pct`% of white people.**
+
+2) **Arrest of all races have declined over time, although relative differences by race in arrest rates remain.**
+
+3) **Differences in arrest rates by race are largely unchanged for Takoma Park residents, and relative differences by race in arrest rates remain.**
+
+# Overall analysis
+
+## Overall
+
+Criminal arrests represent the greatest share of arrests at `r pull_crim_pct`%, followed by traffic stop arrests at `r pull_traffic_pct`%.
+
+
+```{r plot arrest types}
+
+plot_ly(data = arrest_type_data_overall,
+        type = "pie",
+        title = "<b>Total Arrests\nby Type</b>",
+                textposition = "inside",
+        textinfo = "label+percent",
+        values= ~ arrests_type,
+        hole = 0.5,
+        labels = ~overall_type)
+
+```
+
+
+```{r arrests over time}
+
+# calculate total arrests by year and type
+type_year <- all_processed %>%
+  group_by(year) %>%
+  mutate(total = n()) %>%
+  group_by(year, overall_type, total) %>%
+  summarize(year_arrests = n(),
+            pct_year = pct_round(year_arrests, total)) %>%
+  distinct()
+
+# add to list of summary dataframes
+list_pop(type_year, "Year", "Arrest type by year", new_names = c("Year", "Arrest type", "Year total", "Year/type total", "Year/type percent of year"))
+
+# function to filter by year and type
+pull_year_type <- pull_creator(df_result = type_year, filter_col = c("year", "overall_type"))
+
+pull_2015_crime <- pull_year_type(c(2015, "Crime"), "year_arrests")
+
+pull_2020_crime <- pull_year_type(c(2020, "Crime"), "year_arrests")
+
+pull_2020_crime_pct <- pull_year_type(c(2020, "Crime"), "pct_year")
+
+pull_2015_crime_pct <- pull_year_type(c(2015, "Crime"), "pct_year")
+
+pull_2015_traffic <- pull_year_type(c(2015, "Traffic"), "year_arrests")
+
+pull_2020_traffic <- pull_year_type(c(2020, "Traffic"), "year_arrests")
+
+
+```
+
+Total arrests of all types have declined since 2015. Criminal arrests declined the most in absolute terms, from `r pull_2015_crime` in 2015 to `r pull_2020_crime` in 2020. 
+
+The Police Department has provided the following possible reasons for potential decreases in arrests, over the last three years:
+
+1. **Refocus on criminal enforcement** - in 2018 the department moved away from focusing on low level, non-public safety of life offenses. We focused our criminal enforcement to address serious and quality of life crimes; burglaries, robberies, auto thefts, theft from autos, domestic violence etc. We utilized real time crime intel to place officers in problem areas to address crime trends and criminal activity. This led to targeted criminal enforcement that helped address problem areas in the city. While the number of overall arrests made were reduced the quality and impact of the arrests improved. Crime data from 2015-2020 shows an overall 14% decrease UCR part 1 in crime in the city.
+
+2. **Revamping of the Evaluation and Reward System** - in 2018 we changed our evaluation system to focus on community engagement and problem solving over criminal and traffic enforcement. This led to officers not feeling pressured to make low level non-public safety related arrests. This was consistent with promoting quality targeted enforcement, not quantity enforcement.
+
+```{r year arrest citation plot}
+
+# plot of arrests by year
+arrest_citation_num <- plot_ly(type_year, 
+        type = "scatter",
+        mode = "line+marker",
+        x = ~ year,
+        y = ~ year_arrests,
+        color = ~ overall_type,
+        text = ~ paste0("Percent: ", pct_year, "%"),
+        legendgroup = ~ overall_type,
+        name = ~ overall_type) %>%
+  layout(title = "",
+         yaxis = list(title = ""),
+         xaxis = list(title = "")) %>%
+  subplot_title("Total")
+
+# plot of arrests by percent/year
+arrest_citation_pct <- plot_ly(type_year, 
+        type = "scatter",
+        mode = "line+marker",
+        x = ~ year,
+        y = ~ pct_year,
+        color = ~ overall_type,
+        text = ~ paste0("Total: ", year_arrests),
+        legendgroup = ~ overall_type,
+        showlegend = F,
+        name = ~ overall_type) %>%
+  layout(title = "",
+         yaxis = list(title = ""),
+         xaxis = list(title = "")) %>%
+  subplot_title("Percent")
+
+# plot of arrests by type
+subplot(arrest_citation_num, arrest_citation_pct, nrows = 2) %>%
+  layout(title = "Arrests by type over time")
+
+```
+
+## Gender
+
+```{r gender}
+
+# arrests by gender regardless of type
+gender <- summarizer(all_processed, c("a.gender"), "gender")
+
+# arrests by type and gender
+gender_type <- summarizer(all_processed, c( "overall_type", "a.gender"), c( "type","gender")) %>%
+  select(overall_type, a.gender, total_num, type_num, type_pct, type_gender_num, type_gender_pct)
+
+# add to list of summary dataframes
+list_pop(gender, "Gender", c("Gender", "Total arrests", "Gender total", "Gender percent of all"))
+
+list_pop(gender_type, "Gender by type", c("Type", "Gender", "Total arrests", "Type total", "Type percent of all", "Type/gender total", "Type/gender percent of type"))
+
+# pull % man
+pull_men_pct <- gender %>%
+  filter(a.gender == "Man") %>%
+  pull(gender_pct)
+
+# pull range of values for percent of men arrested by type
+pull_range_men_pct <- gender_type %>%
+  filter(a.gender == "Man") %>%
+  pull(type_gender_pct) %>%
+  range()
+
+```
+
+Men represented `r pull_men_pct`% of overall arrests. Women represented `r 100 - pull_men_pct`% of overall arrests.
+
+```{r plot gender}
+
+plot_ly(gender_type,
+        x = ~ overall_type,
+        y = ~ type_gender_num,
+        text = ~ paste0("Percent: ", type_gender_pct, "%"),
+        color = ~ a.gender,
+        name = ~ a.gender,
+        type = "bar") %>%
+  layout(title = "Arrests by gender",
+         xaxis = list(title = "Type"),
+         yaxis = list(title = "Total arrests"))
+
+```
+
+## Age
+
+```{r age}
+
+# group by type and age range
+age <- summarizer(all_processed, c("overall_type", "age_range"), c("typ", "age")) %>%
+  select(overall_type, age_range, total_num, typ_num, typ_pct, typ_age_num, typ_age_pct)
+
+list_pop(age, "Age by type", c("Type", "Age", "Total arrests", "Type total", "Type percent of all", "Type/age total", "Type/age percent of type"))
+
+# pull values
+pull_age <- pull_creator(age, c("overall_type", "age_range"))
+
+
+pull_traffic_2029 <- pull_age(c("Traffic", "29"), "typ_age_pct") 
+
+pull_traffic_3039 <- pull_age(c("Traffic", "30"), "typ_age_pct")
+
+pull_crim_2029 <- pull_age(c("crim", "29"), "typ_age_pct") 
+
+pull_crim_3039 <- pull_age(c("crim", "30"), "typ_age_pct") 
+
+
+```
+
+People aged 18-29 and 30-39 were issued criminal arrests (representing `r pull_crim_2029`% and `r pull_crim_3039`% of arrests, respectively) and traffic arrests (representing `r pull_traffic_2029`% and `r pull_traffic_3039`% respectively) most frequently by police among all age groups.
+
+```{r plot age }
+
+plot_ly(age, 
+        x = ~ overall_type,
+        y = ~ typ_age_num,
+        color = ~ age_range,
+        colors = "Dark2",
+        name = ~ age_range,
+        text = ~ paste0("Percent: ", typ_age_pct, "%"),
+        type = "bar") %>%
+  layout(title = "Arrests by age range",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests")) 
+```
+
+## Residency
+
+```{r city}
+# arrests city regardless of type
+city <- all_processed %>%
+  group_by() %>%
+  mutate(total_arrests = n()) %>%
+  group_by(a.city, total_arrests) %>%
+  summarize(city_arrests = n(),
+            pct_arrest = pct_round(city_arrests, total_arrests)) %>%
+  arrange(desc(city_arrests)) %>%
+  distinct()
+
+# pull next biggest place categorized as other
+pull_city_nextbiggest <- city %>%
+  filter(grepl("Adelphi", a.city)) %>%
+  pull(pct_arrest)
+
+# pull unincorporated in pg county
+pull_city_tpunincorp_pg <- city %>%
+  filter(grepl("TP unincorporated \\(PG\\)", a.city)) %>%
+  pull(pct_arrest)
+
+# pull unincorporated in montgomery county
+pull_city_tpunincorp_mc <- city %>%
+  filter(grepl("TP unincorporated \\(MC\\)", a.city)) %>%
+  pull(pct_arrest)
+
+# pull unknown in city
+pull_num_unknown_city <- city %>%
+  filter(grepl("UNK", a.city)) %>%
+  pull(pct_arrest)
+
+# populate list of datasets
+list_pop(city, "Arrestee city", c("Arrestee city", "Total arrests", "City arrests", "City percent of all"))
+
+# calculate total arrests by city
+city <- all_processed %>%
+  filter(!grepl("UNK", a.city)) %>%
+  group_by() %>%
+  mutate(total_arrests = n()) %>%
+  group_by(a.city, total_arrests) %>%
+  summarize(city_arrests = n(),
+            pct_arrest = pct_round(city_arrests, total_arrests)) %>%
+  arrange(desc(city_arrests)) %>%
+  distinct() %>%
+  mutate(a.city = ifelse(pct_arrest >= 10, a.city, "Other")) %>%
+  group_by(a.city) %>%
+  summarize(city_arrests = sum(city_arrests),
+            pct_arrest = pct_round(city_arrests, total_arrests)) %>%
+  distinct() %>%
+  arrange(desc(pct_arrest))
+
+pull_city <- pull_creator(city, "a.city")
+
+pull_tp_pct <- pull_city("Takoma Park", "pct_arrest")
+
+```
+
+Broken down by city and type of arrest, Takoma Park residents represented `r pull_tp_crim_pct`% of criminal arrests and `r pull_tp_traffic_pct`% of traffic arrests. It should be noted that this excludes `r pull_city_tpunincorp_mc`% of arrests of people living in unincorporated areas with a listed mailing address of Takoma Park (e.g., Takoma Towers) in Montgomery County, and `r pull_city_tpunincorp_pg`% in Prince George's County. This limits the comparability of arrests of Takoma Park residents with other places, because the Department cannot identify addresses in other cities with the city's mailing address that are outside the city's borders (e.g., people with a Silver Spring mailing address outside Silver Spring's actual borders).
+
+```{r plot city type}
+
+plot_ly(city_type, 
+        x = ~ overall_type,
+        y = ~ type_city_num,
+        color = ~ a.city,
+        text = ~ paste0("Percent: ", type_city_pct, "%"),
+        type = "bar",
+        name = ~ a.city) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests"),
+         title = "Arrests by type and city of residence")
+
+
+```
+
+
+*Note: Takoma Park in this graph excludes `r ooc` arrests of people who live in unincorporated areas with a city of address of Takoma Park. Percentages exclude arrests with an unknown city of address, representing `r pull_num_unknown_city`% of arrests. Other includes all arrests involving residents of cities with less than 10% of arrests (the next biggest city was Adelphi, representing `r pull_city_nextbiggest`% of arrests).*
+
+Of all arrests with a known city of residence, `r pull_tp_pct`% of arrests police made were of Takoma Park residents. Silver Spring, DC, and Hyattsville were the most common arrests from other cities, and no other city exceeded `r pull_city_nextbiggest`% of arrests.
+
+```{r plot city}
+
+
+plot_ly(city, 
+        labels = ~a.city, 
+        values = ~city_arrests,
+        type = "pie",
+        title = "<b>Arrests by\ncity of arrestee</b>",
+        textposition = "inside",
+        textinfo = "label+percent",
+        hole = 0.4)
+
+```
+
+*Note: Takoma Park in this graph excludes `r ooc` arrests of people who live in unincorporated areas with a city of address of Takoma Park. Percentages exclude arrests with an unknown city of address, representing `r pull_num_unknown_city`% of arrests. Other includes all arrests involving residents of cities with less than 10% of arrests (the next biggest city was Adelphi, representing `r pull_city_nextbiggest`% of arrests).*
+
+By county, a plurality of arrests were of Montgomery County residents at `r pull_mont_arrcit + pull_tp_county_arrcit`% of arrests with a known county, followed by Prince George's County at `r pull_pg_arrcit`% and DC at `r pull_dc_arrcit`%. Residents of Montgomery County outside of Takoma Park represented `r pull_mont_arrcit`% of arrests. `r pull_oos_arrcit`% of arrests were of out of state residents other than DC.
+
+```{r county plot}
+
+plot_ly(county,
+        labels = ~ a.county,
+        values = ~county_arrests,
+        type = "pie",
+        hole= 0.4,
+        textposition = "inside",
+        textinfo = "label+percent",
+
+        title = "<b>Arrests by\ncounty of residence</b>")
+
+
+# wards = best way to identify tp proper vs not
+# rename - not encounters in location
+
+```
+
+
+*Note: Takoma Park (MC) excludes `r ooc` arrests of people with a Takoma Park mailing address living in unincorporated areas outside of the city's boundaries. Percentages exclude arrests with an unknown county of address, representing `r pull_num_unknown_county`% of arrests. Other includes all arrests involving residents of counties with 5% or fewer arrests (the next biggest county was `r pull_county_nextbiggest`%).*
+
+Among all arrests of Takoma Park residents, police arrested/cited residents of Ward 5 and 6 the most at `r pull_ward5`% and `r pull_ward6`% of arrests respectively, and residents of Ward 1 the least at `r pull_ward1`% of all arrests. 
+
+```{r plot ward}
+
+plot_ly(ward, 
+        x = ~ a.ward,
+        y = ~ ward_num,
+        text = ~ paste0("Percent: ", ward_pct, "%"),
+        type = "bar",
+        color = ~ a.ward,
+        name = ~ a.ward) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests"),
+         title = "Arrests by Ward")
+
+```
+
+## Initiation
+
+In reviewing police reports to prepare this dataset, the Takoma Park Police Department judged how arrests were initiated. The Department coded arrests as officer-initiated; public-initiated (e.g., responding to a call); self-initiated (e.g., the person turned themselves in); and detail-initiated ("contact with the arrestee was initiated by LEO intelligence, or general complaints made by the public").
+
+```{r initiated extra}
+pull_traffic_detail <- pull_initiated(c("Traffic", "Detail"), 'type_init_pct')
+
+pull_crim_detail <- pull_initiated(c("Crime", "Detail"), 'type_init_pct')
+
+
+```
+
+The data shows `r pull_crim_public`% of criminal arrests were public-initiated, while `r pull_traffic_officer`% of traffic arrests were officer-initiated. Detail-initiated arrests represent `r pull_traffic_detail`% of traffic arrests and `r pull_crim_detail`% of criminal arrests.
+
+```{r plot initiatied}
+
+plot_ly(initiated, 
+        x = ~ overall_type,
+        y = ~ type_init_num,
+        color = ~ initiated,
+        name = ~ initiated,
+        text = ~ paste0("Percent: ", type_init_pct, "%"),
+        type = "bar") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests"),
+         title = "Arrests by initiation and type")
+
+```
+
+
+Reviewing arrests by year and type, initiations of all types have declined since 2015 with declining arrests overall. Due to different rates of decline, public-initiated criminal arrests represented `r pull_crim_public_2020`% of criminal arrests in 2020.
+
+```{r plot initiated over time}
+
+# function to generate subplots of initiation based on variable-type and overall-type 
+initiated_generator <- function(type_val, showleg, pct = "number"){
+  if (pct == "number"){
+    
+    var_plot <- plot_ly(initiated_year %>%
+            filter(overall_type == type_val),
+        x = ~ year,
+        y = ~ year_typ_init_num,
+        color = ~ initiated,
+        legendgroup = ~ initiated,
+        text = ~ paste0("Percent: ", year_typ_init_pct, "%"),
+        showlegend = showleg,
+        name = ~ initiated,
+        type = "scatter",
+        mode = "line+marker") 
+  }
+  
+  else if (pct == "percent"){
+    
+    var_plot <- plot_ly(initiated_year %>%
+                          filter(overall_type == type_val),
+                        x = ~ year,
+                        y = ~ year_typ_init_pct,
+                        color = ~ initiated,
+                        legendgroup = ~ initiated,
+                        text = ~ paste0("Total: ", year_typ_init_num),
+                        showlegend = showleg,
+                        name = ~ initiated,
+                        type = "scatter",
+                        mode = "line+marker") 
+  }
+  
+  var_plot %>%
+    layout(xaxis= list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(paste0(type_val, ": ", pct))
+
+}
+
+# plot_civil_year_init_num <- initiated_generator("Civil", F)
+plot_crime_year_init_num <- initiated_generator("Crime", T)
+plot_traffic_year_init_num <- initiated_generator("Traffic", F)
+
+# plot_civil_year_init_pct <- initiated_generator("Civil", T, "percent")
+plot_crime_year_init_pct <- initiated_generator("Crime", F, "percent")
+plot_traffic_year_init_pct <- initiated_generator("Traffic", F, "percent")
+
+
+subplot( plot_crime_year_init_num, plot_traffic_year_init_num, plot_crime_year_init_pct, plot_traffic_year_init_pct, nrows = 2, shareX = T, shareY = T) %>%
+  layout(title = "Arrests by initiation and year")
+
+
+```
+
+## Type-specific
+
+```{r type specific extra}
+
+
+pull_traffic_warrservice <- pull_type_spec(c("Traffic", "Warrant"), "type_desc_pct")
+
+pull_traffic_crimcit <- pull_type_spec(c("Traffic", "Criminal citat"), "type_desc_pct")
+
+pull_crim_warrservice <- pull_type_spec(c("crim", "Warrant"), "type_desc_pct")
+
+pull_crim_crimcit <- pull_type_spec(c("crim", "Criminal citat"), "type_desc_pct")
+
+
+```
+
+By specific type, the most common arrests were full-custody arrests, representing `r pull_crim_typarrests_pct`% of criminal arrests and `r pull_traffic_typarrests_pct`% of traffic arrests. Warrant-service arrests were second most common at `r pull_crim_warrservice`% of criminal arrests and `r pull_traffic_typwarrant_pct`% of traffic, followed by criminal citations at `r pull_crim_crimcit`% of criminal and `r pull_traffic_crimcit`% of traffic arrests.
+
+```{r plot type granular}
+
+plot_ly(type_spec %>%
+          type_desc_prep,
+        x = ~ overall_type,
+        y = ~ type_desc_num,
+        color = ~ type_desc,
+        colors = "Accent",
+        name = ~ type_desc,
+        text = ~ paste0("Percent: ", type_desc_pct, "%")) %>%
+  layout(title = "Arrests by type and description",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Arrests"))
+
+```
+
+
+```{r arrest type_desc over time}
+
+# summarize by year, overall-type, specific type
+type_desc_years <- summarizer(all_processed, group_cols = c("year", "overall_type", "type_desc"), c("year", "typ", "desc")) %>%
+  select(year, overall_type, type_desc, total_num, year_num, year_pct, year_typ_num, year_typ_pct, year_typ_desc_num, year_typ_desc_pct)
+
+# add to list of summary dataframes
+list_pop(type_desc_years, "Specific-type by year", c("Year", "Category", "Type", "Total arrests", "Year total", "Year percent of all", "Year/category total", "Year/category percent of year", "Year/category/type total", "Year/category/type percent of year/category"))
+
+# function to pull by overall type and specific type
+pull_type_desc_years <- pull_creator(type_desc_years, c("year", "overall_type", "type_desc"))
+
+# 
+pull_2015_traffic_arrests_pct <- pull_type_desc_years(c(2015, "Traffic", "^Arrest$"), "year_typ_desc_pct")
+
+pull_2020_traffic_arrests_pct <- pull_type_desc_years(c(2020, "Traffic", "^Arrest$"), "year_typ_desc_pct")
+
+pull_2015_crim_arrests_pct <- pull_type_desc_years(c(2015, "crim", "^Arrest$"), "year_typ_desc_pct")
+
+pull_2020_crim_arrests_pct <- pull_type_desc_years(c(2020, "crim", "^Arrest$"), "year_typ_desc_pct")
+
+pull_2015_traffic_warrants_pct <- pull_type_desc_years(c(2015, "Traffic", "warrant"), "year_typ_desc_pct")
+
+pull_2020_traffic_warrants_pct <- pull_type_desc_years(c(2020, "Traffic", "warrant"), "year_typ_desc_pct")
+
+pull_2015_crim_warrants_pct <- pull_type_desc_years(c(2015, "crim", "warrant"), "year_typ_desc_pct")
+
+pull_2020_crim_warrants_pct <- pull_type_desc_years(c(2020, "crim", "warrant"), "year_typ_desc_pct")
+
+```
+
+All specific types of arrests have declined with overall arrests. Different rates of decline have led to an increased share of full-custody arrests as a proportion of all specific-types of arrests--from `r pull_2015_traffic_arrests_pct`% of traffic arrests and `r pull_2015_crim_arrests_pct`% of criminal in 2015 to `r pull_2020_traffic_arrests_pct`% traffic and `r pull_2020_crim_arrests_pct`% criminal in 2020--and a declining proportion of warrant-service arrests, from `r pull_2015_traffic_warrants_pct`% of traffic arrests and `r pull_2015_crim_warrants_pct`% of criminal in 2015 to `r pull_2020_traffic_warrants_pct`% traffic and `r pull_2020_crim_warrants_pct`% criminal in 2020.
+
+```{r plot arrest type_desc over time}
+
+# function to generate plots of specific-type data for crime/traffic
+type_desc_years_gen <- function(overall_type_val = "Crime", showleg = F, pct_val = "number"){
+  if (pct_val == "number"){
+    sub <- plot_ly(type_desc_years %>%
+                     filter(overall_type == overall_type_val) %>%
+                     type_desc_prep(),
+                   x = ~ year,
+                   y = ~ year_typ_desc_num,
+                   color = ~ type_desc,
+                   legendgroup = ~ type_desc,
+                   showlegend = showleg,
+                   name = ~ type_desc,
+                   colors = "Accent",
+                   type = "scatter",
+                   mode = "line+marker")
+  }
+  
+  else if (pct_val == "percent"){
+        sub <- plot_ly(type_desc_years %>%
+                     filter(overall_type == overall_type_val) %>%
+                     type_desc_prep(),
+                   x = ~ year,
+                   y = ~ year_typ_desc_pct,
+                   color = ~ type_desc,
+                   legendgroup = ~ type_desc,
+                   showlegend = showleg,
+                   name = ~ type_desc,
+                   colors = "Accent",
+                   type = "scatter",
+                   mode = "line+marker")
+  }
+  
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(paste0(overall_type_val, ": ", pct_val))
+}
+
+sub_years_crime_type_desc_num <- type_desc_years_gen(showleg = T)
+sub_years_crime_type_desc_pct <- type_desc_years_gen(pct_val = "percent")
+sub_years_traffic_type_desc_num <- type_desc_years_gen(overall_type_val = "Traffic")
+sub_years_traffic_type_desc_pct <- type_desc_years_gen(overall_type_val = "Traffic", pct_val = "percent")
+
+subplot(sub_years_crime_type_desc_num, sub_years_traffic_type_desc_num,
+        sub_years_crime_type_desc_pct, sub_years_traffic_type_desc_pct, nrows = 2, shareX = T, shareY = T) %>%
+  layout(title = "Arrests by specific-type over time")
+
+```
+
+## Offense
+
+By offense, arrests of persons for outstanding warrants represented the most common kind of criminal arrest at `r pull_crim_warrant_pct`% and the second most common type of traffic arrest at `r pull_traffic_warrant_pct`%. DUIs represented the most common traffic arrest at `r pull_traffic_dui_pct`%.
+
+```{r plot offense}
+
+# generate subplots for offenses by type - total
+sub_offense_gen_num <- function(overall_type_val = "Crime", 
+                                showleg = F){
+  plot_ly(offense %>%
+            filter(overall_type == overall_type_val),
+        x = ~ offense,
+        color = ~ offense,
+        colors = "Set1",
+        name = ~ offense,
+        text = ~ paste0("Percent: ", typ_off_pct, "%"),
+        legendgroup = ~ offense,
+        showlegend = showleg,
+        type = "bar",
+        y = ~ typ_off_num) %>%
+  layout(xaxis = list(title = "",
+                      tickfont = list(size = 10)),
+         yaxis = list(title = ""),
+#                      range = c(0, max(offense$typ_off_num + 10))),
+         title = "") %>%
+  subplot_title(paste0(overall_type_val, ": number"))
+
+}
+
+# subplots for offenses by type - percent
+sub_offense_gen_pct <- function(overall_type_val = "Crime", showleg = F) {
+  plot_ly(offense %>%
+            filter(overall_type == overall_type_val),
+        x = ~ offense,
+        color = ~ offense,
+        colors = "Set1",
+        name = ~ offense,
+        text = ~ paste0("Total: ", typ_off_num),
+        legendgroup = ~ offense,
+        showlegend = showleg,
+        type = "bar",
+        y = ~ typ_off_pct) %>%
+  layout(xaxis = list(title = "",
+                      tickfont = list(size = 10)),
+         yaxis = list(title = "",
+                      range = c(0, max(offense$typ_off_pct + 5))),
+         title = "") %>%
+  subplot_title(paste0(overall_type_val, ": percent"))
+}
+
+subnum_offense_crime_num <- sub_offense_gen_num(showleg = T)
+subnum_offense_traffic_num <- sub_offense_gen_num("Traffic")
+subnum_offense_crime_pct <- sub_offense_gen_pct(showleg = T)
+subnum_offense_traffic_pct <- sub_offense_gen_pct("Traffic")
+
+
+subplot(subnum_offense_crime_num, subnum_offense_traffic_num, shareX = T, shareY = T, nrows = 2) %>%
+  layout(title = "Arrests by offense: total")
+
+```
+
+Together, controlled dangerous substances arrests represented `r pull_cds`% of criminal arrests.
+
+```{r plot arrests by offense pct}
+subplot(subnum_offense_crime_pct, subnum_offense_traffic_pct, shareX = T, shareY = T, nrows = 2) %>%
+  layout(title = "Arrests by offense: percent")
+```
+
+# Race
+
+## Race overall
+
+Black people made up `r pull_black_arrcit_pct`% of arrests, Hispanic people made up `r pull_hisp_arrcit_pct`%, and white people made up `r pull_white_arrcit_pct`%.
+
+```{r plot race}
+# plot
+plot_ly(race_all, 
+        type = "pie",
+        labels = ~ a.race,
+        textposition = "inside",
+        textinfo = "label+percent",
+        values = ~ race_total,
+        hole = 0.4) %>%
+  layout(title = "Arrests by race")
+
+```
+
+
+Arrests of all races have declined since 2015, although relative disparities in arrest rates remain. 
+
+Arrests of Black people declined from `r pull_2015_black_num` in 2015 to `r pull_2020_black_num` in 2020.
+
+Arrests of Hispanic people declined from `r pull_2015_hispanic_num` in 2015 to `r pull_2020_hispanic_num` in 2020.
+
+```{r plot race year}
+
+# subplots of data by race
+sub_year_race_num <- plot_ly(arrests_year, 
+        x = ~ year,
+        y = ~ year_race_num,
+        color = ~ a.race,
+        name = ~ a.race,
+        text = ~ paste0("Percent: ", year_race_pct, "%"),
+        legendgroup = ~ a.race,
+        type = "scatter",
+        mode = "line+marker",
+        showlegend = F) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "")) %>%
+  subplot_title("Total")
+
+sub_year_race_pct <- plot_ly(arrests_year, 
+        x = ~ year,
+        y = ~ year_race_pct,
+        color = ~ a.race,
+        text = ~ paste0("Total: ", year_race_num),
+        name = ~ a.race,
+        legendgroup = ~ a.race,
+        type = "scatter",
+        mode = "line+marker",
+        showlegend = T) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "")) %>%
+  subplot_title("Percent")
+
+subplot(sub_year_race_num, sub_year_race_pct, nrows = 2, shareX = T) %>%
+  layout(title = "Arrests by race over time")
+
+```
+
+## Type and race
+
+```{r pull race type extra}
+
+
+pull_hisp_crim <- pull_race_type(c("Crime", "Hispanic"), "pct_race")
+
+```
+
+Black people represented `r pull_black_typcrime`% of all criminal arrests and `r pull_black_typtraffic`% of traffic arrests. Hispanic people represented `r pull_hispanic_typtraffic`% of all traffic arrests, and `r pull_hisp_crim`% of all criminal arrests. Police issued arrests of all types to white people at similar rates, representing `r pull_white_typtraffic`% of traffic arrests and `r pull_white_typcrime`% of criminal arrests.
+
+```{r plot race type}
+plot_ly(race_type,
+       x = ~ overall_type,
+       y = ~ pct_race,
+       text = ~ paste0("Total: ", race_total),
+       color = ~ a.race,
+       name = ~ a.race, 
+       type = "bar") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Percent"),
+         title = "Percent of all arrests by race")
+
+
+```
+
+
+```{r race type year}
+
+# calculate race by type and year
+race_type_year <- arrprocess::summarizer(all_processed, c("year", "overall_type", "a.race"), c("yr", "typ", "race")) %>%
+  race_prep("a.race") %>%
+  ungroup %>%
+  select(year, overall_type, a.race, total_num, yr_num, yr_typ_num, yr_typ_race_num, yr_typ_race_pct)
+
+# function to pull race/type/year
+pull_race_type_year <- pull_creator(race_type_year, c("year", "overall_type", "a.race"))
+
+# pull values
+pull_black_typcrim_2015_pct <- pull_race_type_year(c(2015, "Crime", "Black"), "yr_typ_race_pct")
+
+pull_black_typcrim_2020_pct <- pull_race_type_year(c(2020, "Crime", "Black"), "yr_typ_race_pct")
+
+pull_hispanic_typcrim_2015_pct <- pull_race_type_year(c(2015, "Crime", "hispanic"), "yr_typ_race_pct")
+
+pull_hispanic_typcrim_2020_pct <- pull_race_type_year(c(2020, "Crime", "hispanic"), "yr_typ_race_pct")
+
+
+list_pop(race_type_year, df_name = "Race by year and type", new_names = c("Year", "Type", "Race", "Total overall", "Year total", "Year/type total", "Year/type/race total", "Year/type/race percent of year/type"))
+
+```
+
+Trends in arrests by type and race over time largely follow overall trends, with a few exceptions. 
+
+The yearly percentage of traffic arrests of Black people remained relatively stable even as the number declined; while the number of criminal arrests of Black people also declined, the percentage increased from `r pull_black_typcrim_2015_pct`% in 2015 to `r pull_black_typcrim_2020_pct`% in 2020. Relatedly, the decline in the percentage of arrests of Hispanic people seems to mostly be driven by a large decline in criminal arrests, from `r pull_hispanic_typcrim_2015_pct`% of yearly arrests in 2015 to `r pull_hispanic_typcrim_2020_pct`% in 2020.
+
+```{r race type year plot}
+
+# function to generate subplots by race, year, time
+subplot_gen <- function(type_filter, 
+                        df = race_type_year, 
+                        x = "year", 
+                        y = "yr_typ_race_num", 
+                        name = "a.race", 
+                        showleg = F){
+  
+  # create subplot title based on parameters provided
+  sub_title <- case_when(grepl("num", y) ~ paste0("Number: ", type_filter),
+                         grepl("pct", y) ~ paste0("Percent: ", type_filter))
+  
+  
+  # plot_ly uses nse - capture variable names
+  x <- sym(x)
+  x <- enquo(x) %>%
+    quo_set_env(global_env())
+  
+  y <- sym(y)
+  y <- enquo(y) %>%
+    quo_set_env(global_env())
+  
+  name <- sym(name)
+  name <- enquo(name)%>%
+    quo_set_env(global_env())
+  
+  # filter df to type selected
+  df <- df %>%
+    filter(overall_type == type_filter)
+  
+  # plot data
+  plot_ly(df,
+          x = x,
+          y = y,
+          name = name,
+          color = name,
+          showlegend = showleg,
+          legendgroup = name,
+          type = "scatter",
+          mode = "legend+marker") %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "")) %>%
+    subplot_title(sub_title)
+  
+}
+
+# generate subplots for crime/traffic and number/pct and assign to global environment
+walk(c("Crime", "Traffic"), function(type){
+  walk(c("yr_typ_race_num", "yr_typ_race_pct"), ~ {
+    showleg <- F
+    if (.x == "yr_typ_race_num" & type == "Crime"){
+      showleg <- T
+    }
+    sub_type <- subplot_gen(type_filter = type, y = .x, showleg = showleg)
+    
+    
+    assign(tolower(paste0("sub", type, .x)),
+                   sub_type, 
+                   pos = global_env())
+  })
+})
+
+# generate subplots
+subplot(subcrimeyr_typ_race_num,
+        subtrafficyr_typ_race_num,
+        subcrimeyr_typ_race_pct,
+        subtrafficyr_typ_race_pct,
+        nrows =2 ,
+        shareX = T, shareY = T) %>%
+  layout(title = "Type of arrest by race")
+
+
+```
+
+## Gender and race
+
+```{r race gender}
+
+# summarize by race/gender
+race_gender <- summarizer(all_processed, group_cols = c("a.gender", "a.race"), c("gender", "race")) %>%
+  select(a.gender, a.race, total_num, gender_num, gender_pct, gender_race_num, gender_race_pct) %>%
+  race_prep("a.race")
+
+# add to list of summary dataframes
+list_pop(race_gender, "Race by gender", c("Gender", "Race", "Total arrests", "Gender total", "Gender percent of all", "Gender/race total", "Gender/race percent of gender"))
+
+# function to pull race/gender values
+pull_race_gender <- pull_creator(race_gender, c("a.race", "a.gender"))
+
+# pull % men arrested among races
+pull_black_men_pct <- pull_race_gender(c("Black", "^Man"), "gender_race_pct")
+
+pull_black_women_pct <- pull_race_gender(c("Black", "Woman"), "gender_race_pct")
+
+pull_white_men_pct <- pull_race_gender(c("white", "^Man"), "gender_race_pct")
+
+pull_white_women_pct <- pull_race_gender(c("white", "Woman"), "gender_race_pct")
+
+
+pull_hisp_men_pct <- pull_race_gender(c("Hispanic", "^Man"), "gender_race_pct")
+
+pull_hisp_women_pct <- pull_race_gender(c("Hispanic", "Woman"), "gender_race_pct")
+
+
+
+pull_black_women_num <- pull_race_gender(c("Black", "Woman"), "gender_race_num")
+
+pull_white_men_num <- pull_race_gender(c("White", "^Man"), "gender_race_num")
+
+
+```
+
+Police arrested Black men and women within genders at rates of `r pull_black_men_pct`% and `r pull_black_women_pct`% respectively. Hispanic men represented `r pull_hisp_men_pct`% of arrests of men, and Hispanic women represented `r pull_hisp_women_pct`% of arrests of women. White people represented `r pull_white_men_pct`% of arrests of men, and `r pull_white_women_pct`% of arrests of women.
+
+```{r plot race/gender}
+plot_ly(race_gender,
+        x = ~ a.gender,
+        y = ~ gender_race_num,
+        color = ~ a.race,
+        name = ~ a.race,
+        text = ~ paste0("Percent of gender: ", gender_race_pct, "%")) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests"),
+         title = "Arrests by race and gender")
+
+```
+
+## Age and race
+
+```{r race/age}
+
+# summarize data by type, age, race
+race_age <- summarizer(all_processed, c("overall_type", "age_range",  "a.race"), c("typ", "age", "race")) %>%
+  select(overall_type, age_range, a.race, total_num, typ_num, typ_pct, typ_age_num, typ_age_pct, typ_age_race_num, typ_age_race_pct)
+
+# add to summary dataframe list
+list_pop(race_age, "Age by race", c("Type", "Age range", "Race", "Total arrests", "Type total", "Type percent of all", "Type/age total", "Type/age percent of type", "Type/age/race total", "Type/age/race percent of type/age"))
+
+# function to pull by race and age
+pull_race_age <- pull_creator(race_age, c("overall_type", "age_range", "a.race"))
+
+# pull %s by age
+pull_crim_black_1019 <- pull_race_age(c("Crime", "10", "Black"), "typ_age_race_pct")
+
+pull_crim_white_1019 <- pull_race_age(c("Crime", "10", "White"), "typ_age_race_pct")
+
+pull_crim_hispanic_3039 <- pull_race_age(c("Crime", "30", "Hispanic"), "typ_age_race_pct")
+
+pull_crim_hispanic_4049 <- pull_race_age(c("Crime", "40", "Hispanic"), "typ_age_race_pct")
+
+pull_traffic_hispanic_3039 <- pull_race_age(c("traffic", "30", "Hispanic"), "typ_age_race_pct")
+
+pull_traffic_hispanic_4049 <- pull_race_age(c("traffic", "40", "Hispanic"), "typ_age_race_pct")
+
+pull_traffic_black_1829 <- pull_race_age(c("Traffic", "18", "Black"), "typ_age_race_pct")
+
+
+```
+
+Differences in arrest rates by race persist across the age spectrum. Black people were arrested at the highest volume of all age groups followed by Hispanic people and white people. Police made more criminal arrests of Hispanic people than white people in all age groups except ages 60-69 and 70+. Hispanic people aged 30-39 represented `r pull_crim_hispanic_3039`% of criminal arrests of people aged 30-39, and `r pull_crim_hispanic_4049`% of all criminal arrests of people aged 40-49.
+
+For traffic arrests, police arrested Black or Hispanic people at the highest-rates in all age groups with more than one total arrest. Police arrested more Hispanic people aged 30-39 compared to other races--representing `r pull_traffic_hispanic_3039`% of traffic arrests for people aged 30-39--and Black people aged 18-29 compared to other races, representing `r pull_traffic_black_1829`% of arrests for the 18-29 age group.
+
+
+```{r plot race/age}
+
+# function to generate race/age subplots by age group
+sub_gen_race_age <- function(typ_v = "Crime", pct_v = "percent", showleg = F){
+  # filter to type
+  race_age <- race_age %>%
+    filter(overall_type == typ_v) %>%
+    race_prep("a.race") 
+  
+  # totals or %s based on pct_v
+  if (pct_v == "percent"){
+    sub <- plot_ly(race_age,
+            x = ~ age_range,
+            y = ~ typ_age_race_pct,
+            color = ~ a.race,
+            name = ~ a.race,
+            showlegend = showleg,
+            type = "bar",
+            legendgroup = ~ a.race,
+            text = ~ paste0("Total: ", typ_age_race_num,
+                            "\nAge group total: ", typ_age_num))
+  }
+  
+  else if (pct_v == "number"){
+    sub <- plot_ly(race_age,
+            x = ~ age_range,
+            y = ~ typ_age_race_num,
+            color = ~ a.race,
+            name = ~ a.race,
+            showlegend = showleg,
+            type = "bar",
+            legendgroup = ~ a.race,
+            text = ~ paste0("Percent: ", typ_age_race_pct, "%"))
+  }
+  
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(paste0(typ_v, ": ", pct_v))
+}
+
+sub_race_age_crim_num <- sub_gen_race_age(pct_v = "number", showleg = T)
+sub_race_age_crim_pct <- sub_gen_race_age()
+sub_race_age_traffic_num <- sub_gen_race_age("Traffic", pct_v = "number", showleg = F)
+sub_race_age_traffic_pct <- sub_gen_race_age("Traffic")
+
+subplot(sub_race_age_crim_num, sub_race_age_traffic_num,
+        sub_race_age_crim_pct, sub_race_age_traffic_pct,
+        nrows = 2, 
+        shareX = T,
+        shareY = T) %>%
+  layout(title = "Arrests by race and age")
+
+```
+
+## Age and gender and race
+
+```{r race age gender}
+
+# summarize by type, gender, age, race
+race_age_gender <- summarizer(all_processed, c("overall_type", "a.gender", "age_range", "a.race"), c("typ", "gen", "age", "race")) %>%
+  select(overall_type, a.gender, age_range, a.race, total_num, typ_num, typ_pct, typ_gen_num, typ_gen_pct, typ_gen_age_num, typ_gen_age_pct, typ_gen_age_race_num, typ_gen_age_race_pct)
+
+list_pop(race_age_gender, "Age and gender by race", c("Type","Gender", "Age", "Race", "Total arrests", "Type total", "Type percent of all", "Type/gender total", "Type/gender percent of type", "Type/gender/age total", "Type/gender/age percent of type/gender", "Type/gender/age/race total", "Type/gender/age/race percent of type/gender/age"))
+
+
+```
+
+Involving arrests of men only, police arrested and issued the highest number of criminal citations to Black men followed by Hispanic men and white men. With arrests involving women only, police arrested and issued the highest number of criminal citations to Black women followed by white women and Hispanic women. 
+
+```{r plot race age gender}
+
+# function to generate plots of race/age/gender
+age_gender_funct <- function(typ = "Crime", gender_val = "Man", pct_val = "number", showleg = F){
+  
+  # filter type and gender
+  df <- race_age_gender %>%
+    filter(overall_type == typ & a.gender == gender_val) %>%
+    race_prep("a.race")
+  
+  # change based on number or percent
+  if (pct_val == "number"){
+      sub <- plot_ly(df, 
+              x = ~ age_range,
+              y = ~ typ_gen_age_race_num,
+              color = ~ a.race,
+              name = ~ a.race,
+              text = ~ paste0("Percent: ", typ_gen_age_race_pct, "%"),
+              legendgroup = ~ a.race,
+              showlegend = showleg,
+              type = "bar")
+  }
+  
+  else if (pct_val == "percent"){
+    sub <- plot_ly(df, 
+                   x = ~ age_range,
+                   y = ~ typ_gen_age_race_pct,
+                   color = ~ a.race,
+                   name = ~ a.race,
+                   text = ~ paste0("Total: ", typ_gen_age_race_num),
+                   legendgroup = ~ a.race,
+                   showlegend = showleg,
+                   type = "bar")
+  }
+  
+  
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "")) %>%
+    subplot_title(paste0(gender_val, ": ", pct_val))
+}
+
+
+sub_age_men_crim_num <- age_gender_funct(showleg = T)
+sub_age_men_crim_pct <- age_gender_funct(pct_val = "percent")
+sub_age_men_traffic_num <- age_gender_funct(typ = "Traffic", showleg = T)
+sub_age_men_traffic_pct <- age_gender_funct(typ = "Traffic", pct_val = "percent")
+
+sub_age_women_crim_num <- age_gender_funct(gender_val = "Woman")
+sub_age_women_crim_pct <- age_gender_funct(gender_val = "Woman",pct_val = "percent")
+sub_age_women_traffic_num <- age_gender_funct(gender_val = "Woman",typ = "Traffic")
+sub_age_women_traffic_pct <- age_gender_funct(gender_val = "Woman",typ = "Traffic", pct_val = "percent")
+
+subplot(sub_age_men_crim_num, sub_age_women_crim_num, sub_age_men_crim_pct, sub_age_women_crim_pct, nrows = 2, shareY = T, shareX = T) %>%
+  layout(title = "Criminal arrests by gender and age")
+
+```
+
+
+Police made traffic arrests of Hispanic men and Black men across the age spectrum at the highest rates followed by Black women and white men. Due to the lower numbers of traffic arrests for women it is harder to draw conclusions about age-based differences in arrest rates of different races.
+
+```{r race age gender traffic plot}
+
+# generate subplots
+subplot(sub_age_men_traffic_num, sub_age_women_traffic_num, sub_age_men_traffic_pct, sub_age_women_traffic_pct, nrows = 2, shareY = T, shareX = T) %>%
+  layout(title = "Traffic arrests by gender and age")
+
+
+```
+
+## Initiation and race
+
+Based on officer coding of initiation status, arrests by initiation show high relative rates of publicly-initiated criminal arrests for Black people and high relative rates of officer-initiated arrests for Hispanic people. Black people had the highest number of arrest initiation-types, followed by Hispanic people, and white people.
+
+```{r initiated}
+
+# summarize by race, type, initiation
+race_initiated <- summarizer(all_processed, group_cols = c("a.race", "overall_type", "initiated"), c("race", "type", "init")) %>%
+  group_by(overall_type, initiated) %>%
+  # calculate overall initiation types and % of race of all initiation
+  mutate(type_all = sum(race_type_init_num)) %>%
+  mutate(race_type_init_pct_type = pct_round(race_type_init_num, type_all))
+
+race_initiated_write <- race_initiated %>%
+  ungroup %>%
+  select(overall_type, initiated, a.race, total_num, type_all, race_num,   race_type_num,  race_type_init_num, race_type_init_pct, race_type_init_pct_type)
+
+list_pop(race_initiated_write, "Race by initiation", c("Type of arrest", "Initiation", "Arrestee race", "Total arrests",  "Type total",  "Race total", "Race/type total", "Race/type/initiation total", "Race/type/initiation percent of race/type", "Race/type/initiation percent of type/initiation"))
+
+# generate subplots of race/type/intiiation
+sub_race_initiated <- function(type_val, val_type  = "percent of race", show_leg = F) {
+  
+  # subplots based on % of race and number
+  if (val_type == "percent of race"){
+      sub <- plot_ly(race_initiated %>%
+            race_prep("a.race") %>%
+            filter(overall_type == type_val),
+          x = ~ a.race,
+          y = ~ race_type_init_pct,
+          color = ~ initiated,
+          name = ~ initiated,
+                      colors = "Paired",
+          legendgroup = ~ initiated,
+          showlegend = show_leg,
+          type = "bar") 
+  
+
+  }
+  
+  else if (val_type == "number"){
+    
+    sub <- plot_ly(race_initiated %>%
+              race_prep("a.race") %>%
+              filter(overall_type == type_val),
+            x = ~ initiated,
+            text = ~ paste0("Percent of initiated-arrests: ", race_type_init_pct_type, "%", "\nPercent of race-arrests: ", race_type_init_pct, "%"),
+            y = ~ race_type_init_num,
+            color = ~ a.race,
+            name = ~ a.race,
+            legendgroup = ~ a.race,
+            showlegend = show_leg,
+            type = "bar") 
+
+  }
+  
+  sub %>%
+    layout(title = "",
+           xaxis = list(title = ""),
+           yaxis = list(title = "")) %>%
+    subplot_title(paste0(type_val))
+}
+
+# generate subplots
+plot_race_initiated_pct_crime <- sub_race_initiated(type_val = "Crime", show_leg = T)
+plot_race_initiated_pct_traffic <- sub_race_initiated(type_val = "Traffic")
+plot_race_initiated_num_crime <- sub_race_initiated(type_val = "Crime", val_type = "number", show_leg = T)
+plot_race_initiated_num_traffic <- sub_race_initiated(type_val = "Traffic", val_type = "number")
+
+subplot(plot_race_initiated_num_crime, plot_race_initiated_num_traffic, nrows = 1, shareX = F, shareY = T) %>%
+  layout(title = "Arrests by initiation and race")
+
+```
+
+## Specific-type and race
+
+```{r race type_desc}
+
+# group by race/type/specific type
+race_type_desc <- summarizer(all_processed, 
+                             group_cols = c("a.race", 
+                                            "overall_type", 
+                                            "type_desc"), 
+                             c("race", "type", "type_spec")) %>%
+  group_by(overall_type, type_desc) %>%
+  mutate(type_total = sum(race_type_type_spec_num),
+         pct_type = pct_round(race_type_type_spec_num, type_total)) %>%
+  race_prep("a.race")
+
+race_type_desc_write <- race_type_desc %>%
+  ungroup %>%
+  select(a.race, overall_type, type_desc, total_num, race_num,  race_type_num,  race_type_type_spec_num, race_type_type_spec_pct, pct_type)
+
+list_pop(race_type_desc_write, "Race by type-description", c("Arrestee race", "Type of arrest", "Type-description", "Total arrests", "Race total", "Race/type total",  "Race/type/description total", "Race/type/description percent of race/type", "Race/type/description percent of all type/description"))
+
+
+```
+
+Black people had the highest arrest totals of specific-types of arrests, followed by Hispanic people and white people.
+
+```{r plot race type_desc}
+
+# subplots
+sub_gen_race_type_desc <- function(type_val = "Crime", showleg = F) {
+  sub <- plot_ly(race_type_desc %>%
+                   filter(overall_type == type_val) %>%
+                   type_desc_prep(), 
+                 x = ~ type_desc,
+                 name = ~ a.race,
+                 color = ~ a.race,
+                 text = ~ paste0("Percent of race-arrests: ", race_type_type_spec_pct, "%", "\nPercent of type-arrests: ", pct_type, "%"),
+                 legendgroup = ~ a.race,
+                 showlegend = showleg,
+                 y = ~ race_type_type_spec_num,
+                 type = "bar")
+  
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "Total arrests"),
+           title = "") %>%
+    subplot_title(paste0(type_val))
+  
+}
+
+
+sub_pct_race_type_desc <- function(type_val = "Crime", showleg = F, pct_type) {
+  
+  if (pct_type == "race"){
+      sub <- plot_ly(race_type_desc%>%
+                   filter(overall_type == type_val) %>%
+                     type_desc_prep(), 
+                 x = ~ a.race,
+                 name = ~ type_desc,
+                 color = ~ type_desc,
+                 colors = "Accent",
+                 text = ~ paste0("Total: ", race_type_type_spec_num),
+                 legendgroup = ~ type_desc,
+                 showlegend = showleg,
+                 y = ~ race_type_type_spec_pct,
+                 type = "bar")
+  }
+  
+  else if (pct_type == "type"){
+    sub <- plot_ly(race_type_desc %>%
+                     filter(overall_type == type_val) %>%
+                     type_desc_prep(), 
+                   x = ~ type_desc,
+                   name = ~ a.race,
+                   color = ~ a.race,
+                   text = ~ paste0("Total: ", race_type_type_spec_num),
+                   legendgroup = ~ a.race,
+                   showlegend = showleg,
+                   y = ~ pct_type,
+                   type = "bar")
+  }
+
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(paste0(type_val, ": percent of ", pct_type))
+}
+
+sub_race_typedesc_crime_num <- sub_gen_race_type_desc(showleg = T)
+sub_race_typedesc_traffic_num <- sub_gen_race_type_desc(type_val = "Traffic")
+
+sub_race_typedesc_crime_pct_race <- sub_pct_race_type_desc(type_val = "Crime", showleg = T, pct_type = "race")
+sub_race_typedesc_traffic_pct_race <- sub_pct_race_type_desc(type_val = "Traffic", showleg = F, pct_type = "race")
+sub_race_typedesc_crime_pct_type <- sub_pct_race_type_desc(type_val = "Crime", showleg = T, pct_type = "type")
+sub_race_typedesc_traffic_pct_type <- sub_pct_race_type_desc(type_val = "Traffic", showleg = F, pct_type = "type")
+
+
+
+subplot(sub_race_typedesc_crime_num, sub_race_typedesc_traffic_num, shareY = T,
+        shareX = T) %>%
+  layout(title = "Arrests by race and description: total")
+
+
+```
+
+
+
+```{r plot percent vals}
+
+subplot(sub_race_typedesc_crime_pct_race, sub_race_typedesc_traffic_pct_race, sub_race_typedesc_crime_pct_type, sub_race_typedesc_traffic_pct_type, shareY = T,
+        shareX = F,
+        nrows = 2) %>%
+  layout(title = "Arrests by race and description: percents")
+
+```
+
+## Offense and race
+
+```{r offense race}
+
+# group by overall type/offense/race
+offense_race <- summarizer(all_processed, c("overall_type", "offense", "a.race"), c("type",  "off", "race"))
+
+offense_race_write <- offense_race %>%
+  ungroup %>%
+  select(overall_type, offense, a.race, total_num, type_num,  type_off_num, type_off_pct, type_off_race_num, type_off_race_pct)
+
+list_pop(offense_race_write, "Race by offense: total", c("Arrest type", "Offense","Arrestee race", "Total arrests", "Type total",  "Type/offense total", "Type/offense percent of type",  "Type/offense/race total", "Type/offense/race percent of type/offense"))
+
+
+# df of crime/non-asian arrests
+offense_race_crim <- offense_race %>%
+  filter(overall_type == "Crime" & a.race != "Asian")
+
+# dataset showing percents of type/offense-totals of arrestees by race
+pull_black_offense_higher <- offense_race %>%
+  ungroup %>%
+  filter(a.race == "Black") %>%
+  select(overall_type, offense, type_off_race_pct) %>%
+  rename(pct_arrcit_black = type_off_race_pct)
+
+pull_hisp_offense_higher <- offense_race %>%
+  ungroup %>%
+  filter(a.race == "Hispanic") %>%
+  select(overall_type, offense, type_off_race_pct) %>%
+  rename(pct_arrcit_hisp = type_off_race_pct)
+
+pull_white_offense_higher <- offense_race %>%
+  ungroup %>%
+  filter(a.race == "White") %>%
+  select(overall_type, offense, type_off_race_pct) %>%
+  rename(pct_arrcit_white = type_off_race_pct)
+
+
+offense_raceprocessed <- offense_race %>%
+  filter(a.race != "Asian") %>%
+  group_by(overall_type, offense) %>%
+  # identify maximum and minimum % of each type/offense by race
+  mutate(max_pct = max(type_off_race_pct),
+         low_pct = min(type_off_race_pct)) %>%
+  # join race-specific datasets by type/offense - with cols for each pct
+  left_join(pull_black_offense_higher) %>%
+  left_join(pull_hisp_offense_higher) %>%
+  left_join(pull_white_offense_higher) %>%
+  # identify which types/offense categories have highest % of Black/hispanic arrestees - true if is, false if not or missing
+  mutate(highest_hisp = pct_arrcit_hisp == max_pct & low_pct != max_pct,
+         highest_hisp = ifelse(is.na(highest_hisp), F, highest_hisp),
+         highest_black = pct_arrcit_black  == max_pct & low_pct != max_pct,
+         highest_black = ifelse(is.na(highest_black), F, highest_black),
+         low_white = low_pct == pct_arrcit_white & low_pct != max_pct,
+         low_white= ifelse(is.na(low_white), T, low_white))
+
+
+offense_raceprocessed_write <- offense_raceprocessed %>%
+  ungroup %>%
+  select(overall_type, total_num, type_num, offense, type_off_num, pct_arrcit_black, pct_arrcit_hisp, pct_arrcit_white) %>%
+  mutate(across(.fns = ~ ifelse(is.na(.x), 0, .x))) %>%
+  distinct()
+
+list_pop(offense_raceprocessed_write, "Race by offense: comparison", c("Type", "Total arrests", "Type total", "Offense", "Type/offense total", "Type/offense percent: Black", "Type/offense percent: Hispanic", "Type/offense percent: white"))
+
+# df of number of offenses with highest/lowest each racial group for criminal/traffic arrests
+pull_num_highest_lowest_crim <- offense_raceprocessed %>%
+  ungroup %>%
+  # restrict to at least 10 uses
+  filter(overall_type == "Crime" & type_off_num >= 10) %>%
+  select(offense, highest_hisp, highest_black, low_white) %>%
+  distinct %>%
+  group_by() %>%
+  summarize(tot = n(),
+            tot_highest_black = sum(highest_black),
+            tot_highest_hisp = sum(highest_hisp),
+            tot_lowest_white = sum(low_white))
+
+pull_num_highest_lowest_traffic <- offense_raceprocessed %>%
+  ungroup %>%
+  filter(overall_type == "Traffic" & type_off_num >= 10) %>%
+  select(offense, highest_hisp, highest_black, low_white) %>%
+  distinct %>%
+  group_by() %>%
+  summarize(tot = n(),
+            tot_highest_black = sum(highest_black),
+            tot_highest_hisp = sum(highest_hisp),
+            tot_lowest_white = sum(low_white))
+
+
+```
+
+Comparing criminal arrests of Black, Hispanic, and white people, police issued the most arrests to Black people in `r pull_num_highest_lowest_crim$tot_highest_black` of the `r pull_num_highest_lowest_crim[["tot"]]` offense categories; the most to Hispanic people in `r pull_num_highest_lowest_crim$tot_highest_hisp` of the offense categories; and the least to white people in `r pull_num_highest_lowest_crim$tot_lowest_white` of the offense categories.
+
+```{r plot offense race}
+
+
+sub_gen_offense_race <- function(overall_type_val = "Crime", pct_val = "Number", showleg = F){
+  
+  offense_race <- offense_race %>%
+    filter(a.race != "Asian") %>%
+    race_prep("a.race") %>%
+    filter(type_off_num >= 10 & overall_type == overall_type_val) %>%
+    mutate(offense = factor(offense, sort(.$offense), sort(.$offense)))
+  
+  if (pct_val == "Percent"){
+    sub <-   plot_ly(offense_race,
+                     x = ~ a.race,
+                     y = ~ type_off_race_pct,
+                     text = ~ paste0("Number: ", type_off_race_num,
+                                     "\nOffense total: ", type_off_num),
+                     showlegend = showleg,
+                     legendgroup = ~ offense,
+                     color = ~ offense,
+                     colors = "Set1",
+                     name = ~ offense)
+    
+  } 
+  
+  else if (pct_val == "Number"){
+    sub <-   plot_ly(offense_race, 
+                     x = ~ a.race,
+                     y = ~ type_off_race_num,
+                     text = ~ paste0("Percent: ", type_off_race_pct, "%",
+                                     "\nOffense total: ", type_off_num),
+                     showlegend = showleg,
+                     legendgroup = ~ offense,
+                     color = ~ offense,
+                     colors = "Set1",
+                     name = ~ offense)
+    
+  }
+  
+  sub %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(paste0(pct_val))
+  
+}
+  
+offense_crime_race_num <- sub_gen_offense_race()
+
+offense_crime_race_pct <- sub_gen_offense_race(pct_val = "Percent",showleg = T)
+offense_traffic_race_num <- sub_gen_offense_race(overall_type_val = "Traffic")
+offense_traffic_race_pct <- sub_gen_offense_race(overall_type_val = "Traffic", pct_val = "Percent", showleg = T)
+
+subplot(offense_crime_race_num, offense_crime_race_pct, nrows = 2, shareX = T, shareY = T) %>%
+  layout(title = "Criminal arrests by offense")
+
+```
+
+*Note: Due to the low number of arrests of Asian people, arrests of Asian people are omitted from the chart above. The chart is also limited to offenses with at least 10 arrests.*
+
+A similar trend follows for traffic arrests. Police made more traffic arrests of Black or Hispanic people across all traffic offense categories with at least 10 arrests. Between arrests of Black, Hispanic, and white people, police issued the most traffic arrests to Black people in `r pull_num_highest_lowest_traffic$tot_highest_black` of the `r pull_num_highest_lowest_traffic[["tot"]]` offense categories; the most to Hispanic people in `r pull_num_highest_lowest_traffic$tot_highest_hisp` of the offense categories; and the least to white people in `r pull_num_highest_lowest_traffic$tot_lowest_white` of the offense categories.
+
+
+```{r plot traffic offense race}
+subplot(offense_traffic_race_num, offense_traffic_race_pct, nrows = 2, shareX = T, shareY = T) %>%
+  layout(title = "Traffic arrests by offense")
+
+
+```
+
+*Note: Due to the low number of arrests of Asian people, arrests of Asian people are omitted from the chart above. The chart is also limited to offenses with at least 10 arrests.*
+
+# Takoma Park Residents by Race
+
+## Takoma Park residents by race overall
+
+```{r race tp}
+
+# function to pull values for takoma park residents by race
+pull_race_tp <- pull_creator(race_tp_notooc_pivot, c("a.race", "source"))
+
+# pull pct arrests/pop different races
+pull_black_tp_pct <- pull_race_tp(c("Black", "Arrest"), pull_col = "pct")
+
+pull_hispanic_tp_pct <- pull_race_tp(c("Hispanic", "Arrest"), pull_col = "pct")
+
+pull_white_tp_pct <- pull_race_tp(c("White", "Arrest"), pull_col = "pct")
+
+pull_black_tp_pop <- pull_race_tp(c("Black", "Population"), pull_col = "pct")
+
+pull_hispanic_tp_pop <- pull_race_tp(c("Hispanic", "Population"), pull_col = "pct")
+
+pull_white_tp_pop <- pull_race_tp(c("White", "Population"), pull_col = "pct")
+
+# calculate population/% difference
+pull_black_tp_arrcit_pop_diff <- pull_black_tp_pct - pull_black_tp_pop
+
+pull_hispanic_tp_arrcit_pop_diff <- pull_hispanic_tp_pct - pull_hispanic_tp_pop
+
+pull_white_tp_arrcit_pop_diff <- abs(pull_white_tp_pct - pull_white_tp_pop)
+
+
+```
+
+`r pull_black_arrcit_pct`% of all police arrests were of Black people, and `r pull_black_tp_pct`% of police arrests of Takoma Park residents were of Black people. Hispanic people represented `r pull_hisp_arrcit_pct`% of all arrests and `r pull_hispanic_tp_pct`% of arrests of Takoma Park residents, and white people represented `r pull_white_arrcit_pct`% of all arrests and `r pull_white_tp_pct`% of arrests of Takoma Park residents.
+
+
+```{r plot race tp}
+# plot race tp
+plot_ly(race_tp_notooc_pivot %>%
+          race_prep("a.race"),
+        x = ~ a.race,
+        y = ~ pct,
+        text = ~ paste0("Total: ", num %>% commafy),
+        color = ~ source,
+        colors = "Set1",
+        name = ~ source) %>%
+  layout(yaxis = list(title = "Percent"),
+         xaxis = list(title = ""),
+         title = "Arrests of Takoma Park residents\ncompared to population share")
+
+
+```
+
+```{r arrests tp type}
+
+# filter to takoma park - then calculate type/race
+tp_arrcit <- all_processed %>%
+  tp_filter() %>%
+  arrprocess::summarizer(group_cols = c("overall_type", "a.race"), output_prefixs = c("type", "race")) %>%
+  race_prep("a.race") %>%
+  ungroup %>%
+  select(overall_type, a.race, total_num, type_num, type_race_num, type_race_pct)
+
+list_pop(tp_arrcit, 
+         df_name = "TP residents by race and type", 
+         new_names = c("Type", "Race", "Total arrests", "Type total", "Type/race total", "Type/race percent of type"))
+
+```
+
+Arrests by type of Takoma Park residents also follow similar patterns as overall arrests by type, except traffic arrests of Black people represent the highest share of traffic arrests and Hispanic people a slightly-lower share of traffic arrests than white people.
+
+```{r plot arrests tp race type}
+
+plot_ly(tp_arrcit, 
+        x = ~ overall_type,
+        y = ~ type_race_num,
+        color = ~ a.race,
+        text = ~ paste0("Percent: ", type_race_pct, "%"),
+        legend = ~ a.race) %>%
+  layout(yaxis = list(title = "Total arrests"),
+         xaxis = list(title = ""),
+         title = "Arrests of Takoma Park residents by race and type")
+
+```
+
+## Takoma Park residents by race and gender
+
+```{r tp res race/gender}
+
+# filter all processed to takoma park
+tp_processed <- all_processed %>%
+  tp_filter()
+
+# calculate gender/race arrests
+tp_race_gender <- summarizer(tp_processed, c("a.gender", "a.race"), c("gender", "race")) %>%
+  select(a.gender, a.race, total_num, gender_num, gender_pct, gender_race_num, gender_race_pct)
+
+# read in acs race/gender/place data - and recalulate by recoded race 
+acs_race_gender_age_place <- read_rds(data_path("acs/acs_race_gender_place_processed.rds")) %>%
+  # filter out white inc. hispanic white
+  filter(!grepl("^white alone$", trimws(race))) %>%
+  # recode race to align with police data
+  mutate(race_recode = race_lookup(race)) %>%
+  # filter out races not appearing in arrest data
+  filter(!race_recode %in% c("Other", "Native American")) %>%
+  # group by race/gender- calculate totals by race and race/gender
+  group_by(race_recode, gender, age, pop_total, gender_total, age_total, gender_age_total) %>%
+  summarize(estimate = sum(estimate),
+            race_tot = sum(race_tot),
+            race_gender_tot = sum(race_gender_tot))
+
+# calculate data by race and gender 
+acs_race_gender <- acs_race_gender_age_place %>%
+  ungroup %>%
+  select(pop_total, gender, race_recode,  gender_total, race_tot, race_gender_tot) %>%
+  distinct() %>%
+  mutate(race_gender_pct_gender = pct_round(race_gender_tot, gender_total),
+         race_gender_pct_race = pct_round(race_gender_tot, race_tot),
+         race_gender_pct_all = pct_round(race_gender_tot, pop_total))
+  
+# join to tp dataset
+tp_race_gender <- tp_race_gender %>%
+  left_join(acs_race_gender, by = c("a.race" = "race_recode", "a.gender" = "gender"))
+
+
+# add to list of summary datasets
+list_pop(tp_race_gender, "TP residents by race/gender", c("Gender", "Race", "Total arrests", "Gender arrests", "Gender-arrests percent of total", "Gender/race arrests", "Gender/race-arrests percent of gender", "TP Population", "Gender population", "Race population", "Race/gender population", "Race/gender percent of gender population", "Race/gender percent of race population", "Race/gender percent total population"))
+
+# pivot so percent of arrests/population in the same column
+tp_race_gender_pivot <- tp_race_gender %>%
+  pivot_longer(c("gender_race_pct", "race_gender_pct_gender")) %>%
+  mutate(name = ifelse(name == "gender_race_pct", "Arrests/\ncitations", "Population"))
+
+
+
+```
+
+By gender and race, arrests similarly mirror overall arrest rates. Men are arrested more frequently than women but within genders similar differences in arrest rates remain, except that Hispanic men are arrested at higher rates than Hispanic women.
+
+```{r tp race/gender plot}
+
+# function to generate plots of race/gender data
+race_gender_tots <- function(gender_val = "Man", showleg = F, sub_title = "Arrests men") {
+  
+  return_plot <- plot_ly(tp_race_gender %>%
+                           # rename(name_val = name) %>%
+                           filter(a.gender == gender_val) %>%
+                           race_prep('a.race'),
+                         x = ~ a.race,
+                         y = ~ gender_race_num,
+                         color = ~ a.race,
+                         name = ~ a.race,
+                         legendgroup = ~ a.race,
+                         type = "bar",
+                         showlegend = showleg) %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "Arrests"),
+           title = "") %>%
+    subplot_title(sub_title)
+  
+  return(return_plot)
+}
+
+# function to generate comparison arrests/population for race and gender
+demog_gender_race <- function(gender_val = "Man", showleg = F, sub_title = "Percent men") {
+
+  return_plot <- plot_ly(tp_race_gender_pivot %>%
+    # rename(name_val = name) %>%
+    filter(a.gender == gender_val) %>%
+      race_prep('a.race'),
+          x = ~ a.race,
+          y = ~ value,
+          color = ~ name,
+    colors = "Set1",
+          name = ~ name,
+          legendgroup = ~ name,
+          type = "bar",
+          showlegend = showleg) %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "Percent-gender"),
+           title = "") %>%
+    subplot_title(sub_title)
+  
+  return(return_plot)
+}
+
+plot_men_race_arrests <- race_gender_tots()
+plot_women_race_arrests <- race_gender_tots("Woman",T, "Arrests women")
+
+plot_men_race <- demog_gender_race()
+plot_women_race <- demog_gender_race("Woman", T, "Percent women")
+
+subplot(plot_men_race_arrests, plot_women_race_arrests,
+        plot_men_race, plot_women_race, 
+        nrows = 2, shareY = T, shareX = T) %>%
+  layout(title = "Arrests by gender and race")
+
+```
+
+## Takoma Park residents by Ward
+
+```{r ward race}
+
+# function to calculate arrests by race by ward
+ward_race <- summarizer(all_processed %>%
+                          filter(grepl("Ward", a.ward)), c("a.ward", "a.race"), c("ward", "race")) %>%
+  select(a.ward, a.race, total_num, ward_num, ward_pct, ward_race_num, ward_race_pct) %>%
+  mutate(ward_race_pct_all = pct_round(ward_race_num, total_num))
+
+
+list_pop(ward_race, "TP residents by race and Ward", c("Ward", "Race", "Total", "Ward total", "Ward percent", "Ward/race total", "Ward/race percent of ward", "Ward/race percent of all"))
+
+# write list of dfs 
+write_rds(dfs_list, "./data/list_arrests.rds")
+
+```
+
+Differences in arrests by race carry to Wards. The City does not have precise information on the racial demographics of its Wards, but does publish an [interactive demographic map](https://www.arcgis.com/apps/View/index.html?appid=1be78451f182406d915c7ab1385c1ceb&extent=-77.0229,38.9687,-76.9816,38.9928) with information on the percent of people of color in Census block groups.
+
+```{r ward race plot}
+plot_ly(ward_race %>%
+          race_prep("a.race"),
+        x = ~ a.ward,
+        y = ~ ward_race_num,
+        color = ~ a.race,
+        name = ~ a.race,
+        text = ~ paste0("Percent ward: ", ward_race_pct, "%",
+                        "\nPercent all city arrests: ", ward_race_pct_all, "%"),
+        type = "bar") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total arrests"),
+         title = "Arrests by race and Ward")
+
+```

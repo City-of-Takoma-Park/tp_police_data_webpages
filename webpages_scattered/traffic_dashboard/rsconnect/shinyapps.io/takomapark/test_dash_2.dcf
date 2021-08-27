@@ -1,0 +1,13 @@
+name: test_dash_2
+title: test_dash_2
+username:
+account: takomapark
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 4498183
+bundleId: 4937620
+url: https://takomapark.shinyapps.io/test_dash_2/
+when: 1629303722.45093
+lastSyncTime: 1629303722.45093
+asMultiple: FALSE
+asStatic: FALSE

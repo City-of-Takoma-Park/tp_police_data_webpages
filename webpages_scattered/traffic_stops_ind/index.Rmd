@@ -1,0 +1,2095 @@
+---
+title: "Takoma Park Police Traffic Stops Analysis"
+date: "August 13, 2021"
+output:
+  # word_document:
+  bookdown::html_document2:
+    toc: yes
+    toc_depth: 4
+    fig_width: 8
+    fig_height: 5
+    fig_caption: yes
+---
+
+<style type="text/css">
+h1 { /* Header 1 */
+  font-weight: bold
+}
+
+
+h2 { /* Header 2 */
+  font-style: italic
+}
+
+<!-- p { /* paragraph */ -->
+<!--   margin-bottom: 12px -->
+<!-- } -->
+
+</style>
+
+# Introduction
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(tidyverse)
+library(plotly)
+library(readxl)
+library(rlang)
+library(leaflet)
+library(spdep)
+library(sf)
+library(glue)
+
+# define data directory
+# content_dir <- "~/r_proj/police_data/police_website_deploy/static/data/"
+
+content_dir <- "./data/"
+
+# function to create path to given data directory
+data_path <- function(string){
+  paste0(content_dir, string)
+}
+
+# define age lookup
+age_lookup <- function(num){
+  # some error values in ages
+  case_when(is.na(num) | num < 15 | num >= 100 ~ "Missing",
+            num < 20 ~ "15-19",
+            num < 30 ~ "20-29",
+            num < 40 ~ "30-39",
+            num < 50 ~ "40-49",
+            num < 60 ~ "50-59",
+            num < 70 ~ "60-69",
+            num >= 70 ~ "70 or higher")
+}
+
+# function to round percents to 1 decimal and express as nums
+pct_round <- function(numerator, denominator){
+  round(numerator * 100 / denominator, 1)
+}
+
+# function to order race consistently for graph colors
+race_prep <- function(df){
+  
+  # pull unique race values from dataframe
+  race_vector <- df[["race"]] %>%
+    unique()
+  
+  # define order
+  race_vector_order <- c("Black",
+                         "Hispanic",
+                         "White",
+                         "Asian",
+                         "Other",
+                         "Native American")
+  
+  # filter order based on whether present in dataframe working with
+  race_present <- race_vector_order[race_vector_order %in% race_vector]
+  
+  # make sure no race values outside of those in order in dataframe
+  if (!all(race_vector %in% c(race_vector_order, NA))){
+    browser()
+    
+    stop("Error; some race categories present in dataframe that not present in order")
+  }
+  
+  # make race a factor variable
+  df <- df %>%
+    mutate(race = factor(race, race_present, race_present))
+  
+  return(df)
+}
+
+# function to format character vector as list
+sentence_format <- function(char_vector, separator= ","){
+  
+  # comma separate lists longer than 2 parts
+  if (length(char_vector) > 2){
+  
+    
+    val <- map2_chr(char_vector, seq_along(char_vector), ~ ifelse(.y == length(char_vector), 
+                                                                  paste0("and ", .x),
+                                                                  paste0(.x, separator, " "))) %>%
+      paste0(collapse = "")
+    
+  }
+  
+  # if two part list add and
+  if (length(char_vector) == 2){
+    val <- paste0(char_vector[1], " and ", char_vector[2])
+  }
+  
+  #otherwise return
+  if (length(char_vector) == 1){
+    val <- char_vector
+  }
+  
+  # error check that not empty
+  if (length(char_vector) == 0){
+    browser()
+    stop("Error; character vector of length 0")
+  }
+  
+  return(val)
+
+  
+}
+
+# load in traffic data
+cad_data <- read.csv(data_path("tp_data/cad_data.csv")) %>%
+  mutate(received_char = received,
+         received = as.Date(received))
+
+# identify multiple calls 1 incident
+cad_dups <- cad_data %>%
+  filter(freq > 1)
+
+# identify instances where no cr report
+missing_cr_report <- cad_data %>%
+  filter(cr.report == "No") %>%
+  pull(event.no.) %>%
+  unique() %>%
+  length()
+  
+# read in wards
+ward_boundaries <- st_read(data_path("wards/buffer_fix.shp")) %>%
+  st_transform(4326)
+
+# filter cad data to incident level - instead of officer-responding level - and turn to spatial data
+cad_data_sf <- cad_data %>%
+  # select top duration event as proxy for responding officer
+  group_by(event.no.) %>%
+  slice(1) %>%
+  # make to points dataset
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326) %>%
+  st_transform(4326) %>%
+  mutate(received_char = received_char,
+         # event.duration = round(event.duration, 2),
+         year = format(received, "%Y"))
+
+# make sure no duplicate events
+cad_dups_check <- cad_data_sf %>%
+  pull(event.no.) %>%
+  unique() %>%
+  length()
+
+# make empty list to save summary-datasets in for traffic dashboard
+dfs_list <- list()
+
+# function to populate list of summary dataframes
+list_pop <- function(df,
+                     df_name, 
+                     new_names, 
+                     pct_cols) {
+  
+  # round numeric columns
+  df <- df %>%
+    ungroup %>%
+    mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+  # if didn't supply as many new column names as in dataframe - return error
+  if (length(new_names) != length(colnames(df))){
+    stop("Error; new names not equal to number of column names in old df")
+  }
+  
+  # set names of dataframe to list of supplied names
+  colnames(df) <- new_names
+  
+  # create a temporary list to store the dataframe and its name
+  temp_list <-  list(df) %>%
+    `names<-`(df_name)
+  
+  # combine the new list into the old list so populated with each addition
+  dfs_list <<- c(dfs_list, temp_list)
+
+}
+
+# create a non-geographic version of dataset
+cad_data_asdata <- cad_data_sf %>%
+  st_drop_geometry()
+
+# add CAD data to list of summary datasets
+list_pop(cad_data_asdata %>% select(-c(X, received_char)), "Computer-Aided Dispatch Base Data", c("Incident number", "Incident type", "Date", "Officer beat", "CR Report?", "Number of responding officers", "Year"), NULL)
+
+# create function to add a subplot title to leaflet map
+subplot_title <- function(plot, title){
+  plot %>%
+    add_annotations(text = paste0("<i><b>", title, "</i></b>"),
+                    x = 0.1,
+                    y = 1, 
+                    yref = "paper",
+                    xref = "paper",
+                    xanchor = "left",
+                    yanchor = "top",
+                    showarrow = FALSE,
+                    font = list(size = 12))
+}
+
+# create function to commasepaate number
+commafy <- function(number){
+  prettyNum(round(number, 2), ",", scientific = FALSE)
+}
+
+# read in traffic data and recode gender
+traffic_data_all <- read.csv(data_path("tp_data/traffic_data_all.csv")) %>%
+  mutate(gender = case_when(gender == "Male" ~ "Man",
+                            gender == "Female" ~ "Woman",
+                            TRUE ~ gender))
+
+# id duplicates in all dataset = multiple traffic stop outcomes
+traffic_data_dups <- traffic_data_all %>%
+  group_by(stop.id) %>%
+  mutate(freq = n()) %>%
+  filter(freq > 1)
+
+# order outcome levels - alphabetical = by severity (citation, repair order, warning)'
+outcome_levels <- c("Citation", "Repair Order", "Warning")
+
+# check any other outcomes
+if (!all(traffic_data_all %>%
+  pull(outcome) %>%
+  unique() %in% outcome_levels)){
+  stop("Error; more outcomes in dataset than citation, repair order, or warning")
+}
+
+# create factor of outcome-levels and age and create year column
+traffic_data_priority <- traffic_data_all %>%
+  mutate(outcome = factor(outcome, 
+                          levels = outcome_levels, 
+                          ordered = TRUE),
+         age_range = age_lookup(age),
+         year = format.Date(date, "%Y"))
+
+# add to dataframe with officer identifier removed
+list_pop(traffic_data_priority %>% select(-c(X)), "Traffic violations", c("Stop ID", "Outcome", "Statute", "Description", "Summary", "Date", "Time", "Location", "Age", "Race/ethnicity", "Gender", "State", "County", "Age range", "Year"), NULL)
+
+# arrange by outcome - and slice
+traffic_data_nodup <- traffic_data_priority %>%
+  mutate(num_citations = ifelse(outcome == "Citation", 1, 0),
+         num_repair = ifelse(outcome == "Repair Order", 1, 0),
+         num_warnings = ifelse(outcome == "Warning", 1, 0)) %>%
+  group_by(stop.id) %>%
+  mutate(num_violations = n(),
+         num_citations = sum(num_citations),
+         num_repair = sum(num_repair),
+         num_warnings = sum(num_warnings)) %>%
+  arrange(outcome) %>%
+  dplyr::slice_head(n = 1)
+
+# write output datasets
+write.csv(traffic_data_nodup, "./data/output/traffic_data_stops.csv")
+openxlsx::write.xlsx(traffic_data_nodup, "./data/output/traffic_data_stops_excel.xlsx", asTable = T)
+
+write.csv(traffic_data_priority, "./data/output/traffic_data_violations.csv")
+openxlsx::write.xlsx(traffic_data_priority, "./data/output/traffic_data_violations_excel.xlsx", asTable = T)
+
+write.csv(cad_data_asdata, "./data/output/cad_data.csv")
+openxlsx::write.xlsx(cad_data_asdata, "./data/output/cad_data_excel.xlsx")
+st_write(cad_data_sf, "./data/output/cad_data.shp", delete_dsn = T)
+
+# confirm worst-outcome sliced
+if (nrow(traffic_data_nodup %>%
+  filter(outcome != "Citation" & num_citations >= 1 | !(outcome %in% c("Citation", "Repair Order")) & num_repair >= 1)) > 0){
+  stop("Error; worst-outcome misidentified")
+}
+
+if (nrow(traffic_data_nodup %>%
+  filter(num_violations == 0)) > 0){
+  stop("Error; some rows with 0 violations")
+}
+
+if (!all(traffic_data_nodup %>%
+  mutate(check_math = num_violations == (num_citations + num_repair + num_warnings)) %>%
+  pull(check_math))){
+  stop("Error; mismatch between total violations and subcomponent violations")
+}
+
+# add to list of summary datasets without officer id number
+list_pop(traffic_data_nodup %>% select(-c(X)), "Traffic stops", c("Stop ID", "Outcome", "Statute", "Description", "Summary", "Date", "Time", "Location", "Age", "Race/ethnicity", "Gender", "State", "County", "Age range", "Year",  "Citations", "Repair orders", "Warnings", "Total Violations"), NULL)
+
+
+```
+
+
+```{r stops by reason}
+
+# group by reason - use all dataset because ok with repeat stops
+traffic_data_all_reasons <- traffic_data_priority %>%
+  group_by() %>%
+  # calculate total reasons used
+  mutate(total = n()) %>%
+  group_by(summary) %>%
+  # calculate total reasons, percent of all, and recode as other if percent low
+  mutate(num = n(),
+         pct_total = pct_round(num, total),
+         summary_recode = ifelse(pct_total < 4, "Other", summary)) %>% 
+  group_by(summary_recode, total) %>%
+  # calculate total again 
+  summarize(num = n(),
+         pct_total = pct_round(num, total)) %>%
+  distinct() %>%
+  arrange(desc(pct_total))
+
+# confirm equal rows between reasons counted and rows in dataframe
+if (!sum(traffic_data_all_reasons$num) == nrow(traffic_data_priority)){
+  stop("Error; mismatch in calculated total reasons and rows in all-reasons dataset")
+}
+
+# pull list of reasons after 4% filter
+reasons_list <- traffic_data_all_reasons$summary_recode
+
+# pull values
+pull_stop_sign_pct <- traffic_data_all_reasons %>%
+  filter(grepl("Special stops", summary_recode, ignore.case = T)) %>%
+  pull(pct_total)
+
+pull_vehequip_pct <- traffic_data_all_reasons %>%
+  filter(grepl("Title and", summary_recode, ignore.case = T)) %>%
+  pull(pct_total)
+
+# pull other reasons that less tan 4% total
+other_reasons <- traffic_data_priority %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(summary) %>%
+  summarize(num = n(),
+         pct_total = pct_round(num, total)) %>%
+  distinct() %>%
+  arrange(desc(pct_total)) %>%
+  filter(pct_total < 4)
+
+# pull highest given reason less than 4% total
+pull_max_other <- other_reasons[1, ][["pct_total"]]
+
+# make into list separated by semi-colon
+pull_other_reasons <- other_reasons %>%
+  pull(summary) %>%
+  sentence_format(";")
+
+```
+
+
+## Overview
+
+The City of Takoma Park Police Department maintains two datasets on traffic incidents involving the Police Department: a "Stops" dataset on police traffic stops between 2015 and 2020, and a "CAD" dataset on traffic incidents involving Computer-Aided Dispatcher (CAD) calls between 2018 and 2020. **We analyzed these datasets to identify total traffic stops, total stops by type, reasons for stops, stops by race, gender, age, and stop-locations.**
+
+The City's Police Department views the purpose of traffic enforcement as to promote public safety by stopping a violation, reducing crashes, and enhancing public safety and enjoyment. At the same time, it deters other drivers from committing an infraction and historically changes behavior of the ticketed driver and onlookers. Education and behavior change are the key components.
+
+There are three major sections to this document:
+
+1) *Overall findings on traffic stops*
+
+2) *Traffic stop data broken out by race*
+
+3) *Analysis and mapping of dispatcher-call data*
+
+```{r stops over time}
+
+# calculate yearly stops and change in stops from prior year
+traffic_data_nodup_stopstime <-traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  ungroup() %>%
+  group_by(year, total) %>%
+  summarize(year_total = n(),
+            year_pct = pct_round(year_total, total)) %>%
+    distinct() %>%
+  ungroup() %>%
+  arrange(year) %>%
+  mutate(lag_total = lag(year_total),
+         chng = year_total - lag_total,
+         pct_chng = pct_round(chng, lag_total),
+         year = factor(year, .$year, .$year))
+
+if (sum(traffic_data_nodup_stopstime$year_total) != nrow(traffic_data_nodup)){
+  stop("Error; mismatch in total yearly stops and rows in data")
+}
+
+# pull values for given years
+pull_stops_2015 <- traffic_data_nodup_stopstime %>%
+  filter(year == 2015) %>%
+  pull(year_total)
+
+pull_stops_2020 <- traffic_data_nodup_stopstime %>%
+  filter(year == 2020) %>%
+  pull(year_total) 
+
+pull_diff_2020_2015 <- pull_stops_2015 - pull_stops_2020
+
+# calculate percent decrease in stops from 2015 to 2020
+pull_pct_decrease_stops_2020_2015 <- 100 - pct_round(pull_stops_2020, pull_stops_2015)
+
+
+```
+
+
+```{r stops by gender}
+
+# calculate stops by gender excluding unknown
+gender <- traffic_data_nodup %>%
+  filter(gender != "Unknown") %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(gender, total) %>%
+  summarise(gender_total = n(),
+            pct_gender = pct_round(gender_total, total)) %>%
+  distinct()
+
+# pull values
+pull_pct_men <- gender %>%
+  filter(gender == "Man") %>%
+  pull(pct_gender)
+
+```
+
+```{r outcomes by residency}
+
+# calculate 
+traffic_data_nodup_county <- traffic_data_nodup %>%
+  filter(county != "N/A" & county != "Unknown") %>%
+  group_by %>%
+  mutate(total = n(),
+         # recode prince georges
+         county = ifelse(grepl("Prince G", county), "Prince George's", county)) %>%
+  ungroup %>%
+  group_by(county) %>%
+  mutate(total_stops = n(),
+         pct_county = pct_round(total_stops, total),
+         # if less than 1% coded as other
+         county = ifelse(pct_county > 1, county, "Other")) %>%
+  ungroup() %>%
+  # recalculate county
+  group_by(county, total) %>%
+  summarize(total_stops = n(),
+         pct_county = pct_round(total_stops, total)) %>%
+  arrange(desc(pct_county)) %>%
+  distinct()
+
+# # confirms all stops accounted for
+if (!sum(traffic_data_nodup_county$total_stops) == nrow(traffic_data_nodup %>%
+  filter(county != "N/A" & county != "Unknown"))){
+  stop("Error; mismatch in total stops in county-aggregated data and number of rows in stops-dataset excluding unknown counties")
+}
+
+pull_mont_stops_pct <- traffic_data_nodup_county %>%
+  filter(grepl("Montgomery", county)) %>%
+  pull(pct_county)
+
+pull_pg_stops_pct <- traffic_data_nodup_county %>%
+  filter(grepl("Prince George", county)) %>%
+  pull(pct_county)
+
+pull_howard_stops_pct <- traffic_data_nodup_county %>%
+  filter(grepl("Howard", county)) %>%
+  pull(pct_county)
+
+pull_outstate_stops_pct <- traffic_data_nodup_county %>%
+  filter(grepl("Out Of", county)) %>%
+  pull(pct_county)
+
+pull_other_stops_pct <- traffic_data_nodup_county %>%
+  filter(grepl("Other", county)) %>%
+  pull(pct_county)
+
+# previously some coded as n/a
+unknown_county <- traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  filter(county == "N/A" | county == "Unknown") %>%
+  group_by(county, total) %>%
+  summarize(freq = n(),
+            pct = pct_round(freq, total)) %>%
+  distinct()
+
+pull_unknown_cnty_num <- unknown_county %>%
+  pull(freq)
+
+pull_unknown_cnty_pct <- unknown_county %>%
+  pull(pct)
+
+  
+```
+
+
+```{r age analysis}
+
+# calculate stops by age
+traffic_age_analysis <- traffic_data_nodup %>%
+  # filter out missing ages - because cant have driving
+  filter(!(age_range %in% c("Missing"))) %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(age_range, total) %>%
+  summarize(age_total = n(),
+         age_pct = pct_round(age_total, total)) %>%
+  distinct
+
+# identify numer of missing ages
+num_stops_missing <- traffic_data_nodup %>%
+  filter(age_range %in% c("Missing")) %>%
+  group_by() %>%
+  summarize(total = n()) %>%
+  distinct() %>%
+  pull(total)
+
+# sort age ranges
+unique_age_original <- sort(unique(traffic_data_nodup$age_range))
+
+# sum(traffic_age_analysis$age_total) + num_stops_missing == nrow(traffic_data_nodup)
+
+# pull values
+pull_30_stops <- traffic_age_analysis %>%
+  filter(grepl("30-39", age_range)) %>%
+  pull(age_total)
+
+pull_20_stops <- traffic_age_analysis %>%
+  filter(grepl("20-29", age_range)) %>%
+  pull(age_total)
+
+pull_30_stops_pct <- traffic_age_analysis %>%
+  filter(grepl("30-39", age_range)) %>%
+  pull(age_pct)
+
+pull_20_stops_pct <- traffic_age_analysis %>%
+  filter(grepl("20-29", age_range)) %>%
+  pull(age_pct)
+
+
+```
+
+
+```{r outcome race counts,include=FALSE}
+
+# calculate total stops by race
+traffic_data_nodup_racecounts <-traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  ungroup() %>%
+  group_by(race, total) %>%
+  summarize(freq = n(),
+            pct_all = pct_round(freq, total)) %>%
+  distinct()
+
+# pull values
+pull_black_stops_num <- traffic_data_nodup_racecounts %>%
+  filter(race == "Black") %>%
+  pull(freq)
+
+pull_black_stops_pct <- traffic_data_nodup_racecounts %>%
+  filter(race == "Black") %>%
+  pull(pct_all)
+
+pull_hispanic_stops_pct <- traffic_data_nodup_racecounts %>%
+  filter(race == "Hispanic") %>%
+  pull(pct_all)
+
+pull_hispanic_stops_num <- traffic_data_nodup_racecounts %>%
+  filter(race == "Hispanic") %>%
+  pull(freq)
+
+pull_white_stops_pct <- traffic_data_nodup_racecounts %>%
+  filter(race == "White") %>%
+  pull(pct_all)
+
+pull_white_stops_num <- traffic_data_nodup_racecounts %>%
+  filter(race == "White") %>%
+  pull(freq)
+
+```
+
+
+```{r number of traffic stops per year}
+# num traffic stops by year by race
+traffic_stops_race <- traffic_data_nodup %>%
+  group_by(year) %>%
+  mutate(year_total = n()) %>%
+  ungroup() %>%
+  group_by(race, year, year_total) %>%
+  summarize(race_num = n(),
+            race_pct_year = pct_round(race_num, year_total)) %>%
+  distinct()
+
+# pull values
+pull_black_stops_2015_num <- traffic_stops_race %>%
+  filter(race == "Black" & year == 2015) %>%
+  pull(race_num)
+
+pull_black_stops_2015_pct <- traffic_stops_race %>%
+  filter(race == "Black" & year == 2015) %>%
+  pull(race_pct_year)
+
+pull_hisp_stops_2015_pct <- traffic_stops_race %>%
+  filter(race == "Hispanic" & year == 2015) %>%
+  pull(race_pct_year)
+
+pull_hisp_stops_2015_num <- traffic_stops_race %>%
+  filter(race == "Hispanic" & year == 2015) %>%
+  pull(race_num)
+
+pull_white_stops_2015_num <- traffic_stops_race %>%
+  filter(race == "White" & year == 2015) %>%
+  pull(race_num)
+
+pull_white_stops_2015_pct <- traffic_stops_race %>%
+  filter(race == "White" & year == 2015) %>%
+  pull(race_pct_year)
+
+pull_black_stops_2015_num <- traffic_stops_race %>%
+  filter(race == "Black" & year == 2015) %>%
+  pull(race_num)
+
+pull_black_stops_2020_num <- traffic_stops_race %>%
+  filter(race == "Black" & year == 2020) %>%
+  pull(race_num)
+
+pull_black_stops_2020_pct <- traffic_stops_race %>%
+  filter(race == "Black" & year == 2020) %>%
+  pull(race_pct_year)
+
+pull_hisp_stops_2020_pct <- traffic_stops_race %>%
+  filter(race == "Hispanic" & year == 2020) %>%
+  pull(race_pct_year)
+
+pull_hisp_stops_2020_num <- traffic_stops_race %>%
+  filter(race == "Hispanic" & year == 2020) %>%
+  pull(race_num)
+
+pull_white_stops_2020_num <- traffic_stops_race %>%
+  filter(race == "White" & year == 2020) %>%
+  pull(race_num)
+
+pull_white_stops_2020_pct <- traffic_stops_race %>%
+  filter(race == "White" & year == 2020) %>%
+  pull(race_pct_year)
+
+```
+
+## Data Highlights
+
+***Overall***
+
+1) Total traffic stops declined significantly between 2015 and 2020, from `r pull_stops_2015 %>% commafy` stops in 2015 to `r pull_stops_2020  %>% commafy` in 2020, with the biggest decrease coming in citations.
+
+2) People outside of Montgomery County made up `r 100 - pull_mont_stops_pct`% of stops.
+
+3) Men represented `r pull_pct_men`% of stops, and people aged 20-39 represented `r pull_30_stops_pct + pull_20_stops_pct`% of stops.
+
+4) The most common reason for stops was "Special Stops Required" (e.g., failure to stop at a stop sign) at `r pull_stop_sign_pct`%, followed by "Title and Registration" at `r pull_vehequip_pct`%.
+
+***By race***
+
+5) `r pull_black_stops_pct`% of all traffic stops were of Black people, `r pull_hispanic_stops_pct`% of traffic stops were of Hispanic people, and `r pull_white_stops_pct`% of traffic stops were of white people.
+
+6) Stops of all races have declined with overall stops. Total stops of Black people declined from `r pull_black_stops_2015_num  %>% commafy` in 2015 to `r pull_black_stops_2020_num  %>% commafy` in 2020, and total stops of Hispanic people declined from `r pull_hisp_stops_2015_num  %>% commafy` in 2015 to `r pull_hisp_stops_2020_num  %>% commafy` in 2020. 
+
+7) Relative differences in stop-rates by race persisted. As a share of total yearly stops, stop-rates of Black people declined from `r pull_black_stops_2015_pct`% in 2015 to `r pull_black_stops_2020_pct`% in 2020. Stop-rates of Hispanic people increased from `r pull_hisp_stops_2015_pct`% in 2015 to `r pull_hisp_stops_2020_pct`% in 2020. Stop-rates of white people remained stable.
+
+8) Black people pulled over by police between 2015 and 2020 were slightly more likely to have a stop end in a repair order, and in 2020 Hispanic people were more likely to have a stop end in a citation.
+
+## Background on TPPD Traffic Data/Data Methods
+
+The first dataset, "Stops," includes data from 2015 to 2020, and records all stops in which an officer issues a citation, repair order, or warning. **All traffic stops recorded were the result of observable traffic violations, response to traffic accidents, or investigations.** Data comes from the statewide ticketing database E-tix, and there are instances in E-tix where a citation, warning, or SERO may be issued that are not related to traffic stops - per say - because they were issued for other various reasons, such as an accident investigation, investigatory stop based on criminal violations, or sobriety checkpoint.
+
+The Department provided the following five possible outcomes to a traffic stop, three of which appear in this dataset:
+
+1. *Verbal Warning* - an officer can issue a verbal warning for a violation. **Note:** This would not appear in the dataset because race, gender, and residency are not recorded in these stops.
+
+2. *Written Warning* - an officer can issue a written warning. Written warnings are tracked through the statewide database E-tix, and appear in the dataset.
+
+3. *State Citation* - an officer can issue a state citation. State citations are tracked through the statewide database E-tix, and appear in the dataset.
+
+4. *Safety Equipment Repair Order (SERO)* - an officer can issue a SERO. SERO stops do not involve moving violations. They are related to the safety of the vehicle on the road. Examples of SERO’s are: headlight out, broken windshield, and broken brake lights. No fine or points are associated with SERO’s.  It is a written notice to repair an equipment issue within a prescribed time frame. Failure to do so in the prescribed time frame can lead to possible suspension of the involved vehicle's registration. These appear in the dataset.
+
+5. *Arrest (traffic, warrant, or criminal)* - traffic stops can result in an arrest for traffic violations (driving under the influence and other serious driving offenses), a warrant arrest (an individual is stopped and the resulting status check reveals they have an outstanding arrest warrant), or a criminal arrest (a criminal offense is discovered during the course of the traffic stop). **Note:** These do not appear in the dataset, because they are tracked in a separate system. There are stops in the dataset that involve an arrest, but they cannot be distinguished. For example, if an officer stopped someone for speeding, discovered they had an outstanding warrant, and arrested them, they would enter a citation for speeding in the ticketing system and write an arrest report in a different system; in this dataset, the incident would show up as a citation for speeding.
+
+Each row in the dataset represents a reason for a stop resulting in a citation, written warning, or repair order; e.g., one stop could have three rows if it results in two warnings and a citation for three separate reasons. The dataset contains information on the race, gender, and age of the person stopped, the date of the stop, the general location of the stop, the state and county of residence of the person stopped, and the reason for the stop.
+
+The second dataset, "CAD," runs from 2018 to 2020, and contains information on Computer-Aided Dispatch (CAD) calls (incidents in which an officer called a dispatcher; e.g., to run someone's plates). Calls for service that come through the County 911 system are entered into CAD by Montgomery County dispatchers and routed to the TPPD for service. Upon receiving a call, Montgomery County dispatchers create an incident and code it as a traffic stop, a motorist assist, or an accident. The system records the exact location of the incident, as well as the amount of time the dispatcher was on the call. It also includes information on the beat of the officer who responded. It does not include demographic information on persons involved in the incident.
+
+There is a mismatch between the total dispatcher calls coded as traffic stops identified in the CAD data, and the total stops in the traffic stop data. The two datasets are not linked; of the `r nrow(cad_data_asdata)  %>% commafy` events in the CAD data, only `r (nrow(cad_data_asdata) - missing_cr_report)  %>% commafy` had an associated report. Some reasons for the mismatch include:
+
+1) *Different definitions of traffic stops:* The traffic stops data defines stops as incidents in which a warning, repair order, or citation are recorded in the ticketing system based on a stop. If none of these are recorded, they are excluded from the dataset. The CAD dataset automatically records all calls as incidents, and leaves it to the discretion of the county dispatcher to code an incident as a stop; therefore, incidents in which a warning, citation, or repair order are not issued (and therefore don't appear in the traffic stops dataset) may be recorded as stops in the CAD system. It's also likely that in some instances, County dispatchers inadvertently coded motorist assistance or accident calls as stops (although this could also go the other way, in dispatchers incorrectly coding stops as other incidents).
+
+2) *Multiple events in the CAD data for the same stop*: In at least a few instances, the CAD data may have recorded multiple events for the same incident. For instance, multiple incidents will appear for the same officer in too short an amount of time for the officer to have had multiple incidents.
+
+# Stops Overall
+
+## Stops by Outcome and Over-Time
+
+```{r reason pull over}
+# calculate stops by outcome
+traffic_data_nodup_outcome <-traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  ungroup() %>%
+  group_by(outcome, total) %>%
+  summarize(outcome_total = n(),
+            outcome_pct = pct_round(outcome_total, total)) %>%
+  distinct() 
+
+# pull data
+pull_total_stops <- prettyNum(traffic_data_nodup_outcome[["total"]][1], big.mark = ",", scientific = FALSE)
+
+pull_pct_citations <- traffic_data_nodup_outcome %>%
+  filter(outcome == "Citation") %>%
+  pull(outcome_pct)
+
+pull_pct_warning <- traffic_data_nodup_outcome %>%
+  filter(outcome == "Warning") %>%
+  pull(outcome_pct)
+
+```
+
+**Between 2015 and 2020, the City of Takoma Park's Police Department made `r pull_total_stops` traffic stops involving a warning, repair order, or citation.** Citations made up a plurality of stops, representing `r pull_pct_citations`% of stop outcomes, followed by warnings at `r pull_pct_warning`% of stops. In some instances, there were multiple outcomes associated with one stop; we associated a stop with the most severe outcome (i.e., citations, then repair orders, then warnings) so that data in the table below represents unique stops. 
+
+```{r reason pull over plot}
+
+# populate list of datasets with stops by outcome
+list_pop(traffic_data_nodup_outcome, "Stops by worst-outcome", c("Outcome", "Total stops overall", "Total stops of worst-outcome", "Worst-outcome percent of total stops"), "outcome_pct")
+
+# plot data
+plot_ly(traffic_data_nodup_outcome,
+        labels = ~ outcome,
+                textposition = "inside",
+        textinfo = "label+percent",
+
+        values = ~ outcome_total,
+        hole = 0.4,
+        type = "pie") %>%
+  layout(title = "Traffic stops by worst outcome")
+```
+
+**Traffic stops consistently declined between 2015 and 2020,** decreasing `r pull_pct_decrease_stops_2020_2015`% over the five years of available data from `r pull_stops_2015 %>% commafy` in 2015 to `r pull_stops_2020 %>% commafy` in 2020.
+
+```{r plot stops over time}
+
+# add stops over time to list of summary datasets
+list_pop(traffic_data_nodup_stopstime %>%
+           select(-c(lag_total)), 
+         "Stops over time",
+         c("Year", "Total stops", "Year stops", "Year percent of all stops", "Change from previous year", "Percent change from previous year"),
+         c("year_pct", "pct_chng"))
+
+# generate subplots of total change over year and percent change over year
+sub_tot_stops <- plot_ly(traffic_data_nodup_stopstime,
+        x = ~ year,
+        y = ~ year_total,
+        showlegend = F,
+        type = "scatter",
+        name = "Total stops",
+        mode = "line+marker") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total stops")) %>%
+  subplot_title("Stops over time")
+  
+
+sub_pct_chng_stops <- plot_ly(traffic_data_nodup_stopstime, 
+                              x = ~ year, 
+                              y = ~ pct_chng,
+                              name = "Percent change",
+                              showlegend = F,
+                              type = "bar") %>%
+  layout(xaxis = list(title =""),
+         yaxis = list(title = "Percent change")) %>%
+  subplot_title("Percent\nchange")
+
+subplot(sub_tot_stops, sub_pct_chng_stops, nrows = 2, shareX = TRUE) %>%
+  layout(title = "Change in stops")
+
+```
+
+
+```{r outcome by year}
+
+# calculate outcomes by year over time
+traffic_data_nodup_year_outcome <- traffic_data_nodup %>%
+  group_by(year) %>%
+  mutate(total = n()) %>%
+  ungroup() %>%
+  group_by(year, outcome, total) %>%
+  summarize(outcome_total = n(),
+         pct_outcomes = pct_round(outcome_total, total)) %>%
+  distinct()
+
+# pull values
+pull_citation_2015 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2015 & outcome == "Citation") %>%
+  pull(outcome_total)
+
+pull_citation_2020 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2020 & outcome == "Citation") %>%
+  pull(outcome_total)
+
+pull_citation_pct_2018 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2018 & outcome == "Citation") %>%
+  pull(pct_outcomes)
+
+pull_citation_pct_2020 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2020 & outcome == "Citation") %>%
+  pull(pct_outcomes)
+
+pull_warning_pct_2018 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2018 & outcome == "Warning") %>%
+  pull(pct_outcomes)
+
+pull_warning_pct_2020 <- traffic_data_nodup_year_outcome %>%
+  filter(year == 2020 & outcome == "Warning") %>%
+  pull(pct_outcomes)
+
+list_pop(traffic_data_nodup_year_outcome, "Stops by outcome over time", c("Year", "Outcome", "Year stops", "Year/outcome stops", "Year/outcome percent of year stops"))
+
+```
+
+**All types of traffic stops declined between 2015 and 2020, but the biggest decline in worst-outcomes occurred for citations,** which decreased from `r pull_citation_2015 %>% commafy` in 2015 to `r pull_citation_2020 %>% commafy` in 2020. Since 2018, citations have also decreased in relative terms while warnings have increased, with citations declining from `r pull_citation_pct_2018`% of traffic stop worst-outcomes in 2018 to `r pull_citation_pct_2020`% in 2020, as warnings increased from `r pull_warning_pct_2018`% of worst-outcomes in 2018 to `r pull_warning_pct_2020`% of worst-outcomes in 2020. 
+
+```{r plot outcome by year}
+
+# subplot of total outcomes by year/stop
+sub_outcome_year_total <- plot_ly(traffic_data_nodup_year_outcome, 
+        x = ~ year,
+        y = ~ outcome_total,
+        name = ~ outcome,
+        color = ~ outcome,
+        legendgroup = ~ outcome,
+        showlegend = FALSE,
+        type = "bar") %>%
+  layout(title = "Outcomes by year",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Total stops")) %>%
+  subplot_title("Total")
+
+sub_outcome_year_pct <- plot_ly(traffic_data_nodup_year_outcome, 
+        x = ~ year,
+        y = ~ pct_outcomes,
+        name = ~ outcome,
+        color = ~ outcome,
+        legendgroup = ~ outcome,
+        showlegend = T,
+        type = "scatter",
+        mode = "line+marker") %>%
+  layout(title = "",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Percent of outcomes")) %>%
+  subplot_title("Percent")
+
+subplot(sub_outcome_year_total, sub_outcome_year_pct, nrows = 2, shareX = TRUE) %>%
+  layout(title = "Worst-outcomes by year")
+
+```
+
+The Police Department has provided the following possible reasons for potential decreases in stops over the last three years:
+
+1. **Refocus on traffic enforcement**- in 2018 the department moved away from random traffic enforcement to targeted enforcement.  Utilizing traffic collision data and resident complaints, we focused departmental traffic enforcement in problem areas in the city. This led to quality traffic stops that helped address problem areas in the city. While the number of overall stops were reduced the quality and impact of the stops improved. Collision data over the three years, 2018-2020, shows a reduction in overall collisions in the city compared to 2015-2017.
+
+2. **Revamping of the Evaluation and Reward System**- in 2018 we changed our evaluation system to focus on community engagement and problem solving over traffic and criminal enforcement. This led to officers not feeling pressured to make non-impactful traffic stops and arrests. This was consistent with promoting quality targeted enforcement, not quantity enforcement.
+
+3. **Expanding the efficiency of the city’s speed cameras** - in 2020 the police department renegotiated the safe speed contract with our service provider. Part of the new contract involved installing new equipment throughout the city. This increased the efficiency of the units and expanded coverage area for all cameras on our main roadway in the city, New Hampshire Avenue. Coverage area increased from one lane of traffic to cover all three lanes increasing coverage area and reducing our need for manned traffic enforcement in certain areas.   
+
+## Stops by Residence
+
+The City only has partial residency information for people stopped by Takoma Park police, with state, county, and zip-code information. **Half of residents stopped are from Montgomery County (`r pull_mont_stops_pct`%), with the second-most residents stopped from Prince George's County at `r pull_pg_stops_pct`%**, and third most from Howard County at `r pull_howard_stops_pct`%. The remaining stops were either other counties in Maryland (`r pull_other_stops_pct`%) or out-of-state residents (`r pull_outstate_stops_pct`%).
+
+```{r outcomes by residency plot}
+
+list_pop(traffic_data_nodup_county, df_name = "Stops by county of residence", c("County", "Total stops", "County stops", "County percent of all stops"), "pct_county")
+
+plot_ly(traffic_data_nodup_county,
+        type = "pie",
+        values = ~ total_stops,
+                textposition = "inside",
+        textinfo = "label+percent",
+        labels = ~ county, 
+        hole = 0.4) %>%
+  layout(title = "Traffic stops by county of residence")
+
+```
+
+## Stops by Reason
+
+**The most common reason police cited for pulling someone over was "special stops required" (e.g., failure to stop at a stop sign)--representing `r pull_stop_sign_pct`% of reasons cited--followed by "title and registration,"** representing `r pull_vehequip_pct`%. Officers can cite multiple reasons for a stop, so the data below shows the percentage of times a reason was cited among all reasons, not that a stop was made.
+
+```{r stops by reason plot}
+list_pop(traffic_data_all_reasons, "Stops by reason", c("Reason", "Total violations", "Reason total uses", "Reason percent of all violations"), "pct_total")
+
+plot_ly(traffic_data_all_reasons,
+        type = "pie",
+        # text = ~ paste0(summary_recode),
+        textposition = "inside",
+        textinfo = "label+percent",
+        labels = ~ summary_recode,
+        values = ~ num,
+        hole = 0.4) %>%
+  layout(title = "Stops by reason")
+
+```
+
+*Note: The "Other" category above includes all reasons that represented below 4% of uses. These include (in order of frequency, with the highest representing `r pull_max_other`% of uses of reasons): `r pull_other_reasons`*
+
+```{r reasons over time}
+# calculate use of reasons by year
+traffic_data_all_reasons_year <- traffic_data_priority %>%
+  group_by(year) %>%
+  mutate(year_total = n()) %>%
+  group_by(year, year_total, summary) %>%
+  mutate(reason_year_num  = n(),
+            reason_year_pct = pct_round(reason_year_num, year_total),
+         # classify as not other if it overall made up more than 4% of reasons
+         summary_recode = ifelse(summary %in% reasons_list, summary, "Other")) 
+
+traffic_data_all_reasons_year <- traffic_data_all_reasons_year %>%
+  group_by(year, year_total, summary_recode) %>%
+  summarize(reason_year_num  = n(),
+         reason_year_pct = pct_round(reason_year_num, year_total)) %>%
+  distinct()
+
+if (!(sum(traffic_data_all_reasons_year$reason_year_num) == nrow(traffic_data_priority))){
+  stop("Error; mismatch in aggregated reason per year total and reasons in violations dataset")
+}
+
+# pull values
+pull_vehequip_pct_2016 <- traffic_data_all_reasons_year %>%
+  filter(year == 2016 & grepl("Title and", summary_recode, ignore.case = TRUE)) %>%
+  pull(reason_year_pct)
+
+pull_vehequip_pct_2017 <- traffic_data_all_reasons_year %>%
+  filter(year == 2017 & grepl("Title and", summary_recode, ignore.case = TRUE)) %>%
+  pull(reason_year_pct)
+
+pull_failstop_pct_2017 <- traffic_data_all_reasons_year %>%
+  filter(year == 2017 & grepl("Special stops", summary_recode, ignore.case = TRUE)) %>%
+  pull(reason_year_pct)
+
+pull_failstop_pct_2019 <- traffic_data_all_reasons_year %>%
+  filter(year == 2019 & grepl("Special stops", summary_recode, ignore.case = TRUE)) %>%
+  pull(reason_year_pct)
+
+
+```
+
+Aside from a relative increase--not an absolute increase, because stops overall declined--in use of "special stops required," a relative increase in use of "title and registration," and a relative decrease in use of "vehicle equipment issues," there do not appear to be clear trends in changes in the reasons for stops over time.
+
+```{r reasons over time plot}
+
+list_pop(traffic_data_all_reasons_year, "Stops by reason over time", c("Year", "Total violations in year (uses of stop-reasons)", "Stop-reason", "Stop-reason uses in year", "Stop-reason percent of violations in year"), "reason_year_pct")
+
+# plot data
+plot_ly(traffic_data_all_reasons_year, 
+        x = ~ year,
+        y = ~ reason_year_pct,
+        color = ~ summary_recode,
+        name = ~ summary_recode,
+        text = ~ paste0("Uses: ", reason_year_num %>% commafy),
+        type = "scatter",
+        mode = "marker+line") %>%
+  layout(title = "Percent of stop reasons over time",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Percent of reasons"))
+
+```
+
+*Note: The "Other" category above includes all reasons that represented below 4% of uses. These include (in order of frequency, with the highest representing `r pull_max_other`% of uses of reasons): `r pull_other_reasons`*
+
+## Stops by Gender
+
+**Police stopped men most often,** representing `r pull_pct_men`% of all stops.
+
+```{r stops by gender plot}
+
+list_pop(gender, "Stops by gender", new_names = c("Gender", "Total stops overall", "Total gender-stops", "Gender-percent of all stops"), "pct_gender")
+
+# plot gender
+plot_ly(gender, 
+        type = "pie",
+        labels = ~ gender,
+        values = ~ gender_total,
+                textposition = "inside",
+        textinfo = "label+percent",
+        hole = 0.4) %>%
+  layout(title = "Stops by gender")
+
+```
+
+## Stops by Age
+
+Examining stops by age, police stopped people aged 30-39 most frequently between 2015 and 2020 (`r pull_30_stops  %>% commafy` times), followed by people aged 20-29 (`r pull_20_stops  %>% commafy` times).
+
+```{r age plot}
+
+list_pop(traffic_age_analysis, "Stops by age", c("Age range", "Total stops overall", "Total stops of age group", "Percent of age group stops"), "age_pct")
+
+plot_ly(traffic_age_analysis, 
+        x = ~ age_range,
+        y = ~ age_total,
+        text = ~ paste0("Percent: ", age_pct, "%"),
+        color = ~ age_range,
+        name = ~ age_range) %>%
+  layout(title = "Traffic stops by age range",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Stops"))
+
+```
+
+*Note: There were `r num_stops_missing  %>% commafy` age values that were miscoded in the data (over 100 or under 15, some of which were negative), and they are excluded from the above chart.*
+
+# Stops by Race
+
+## Outcomes and Stops Over Time
+
+Black people were stopped by police most often--representing `r pull_black_stops_num  %>% commafy` stops and `r pull_black_stops_pct`% of all stops--and Hispanic people second most often, representing `r pull_hispanic_stops_num %>% commafy` stops and `r pull_hispanic_stops_pct`% of all stops. Police stopped `r pull_white_stops_num %>% commafy` white people, representing `r pull_white_stops_pct`% of stops.
+
+```{r race plot}
+# plot by race
+list_pop(traffic_data_nodup_racecounts, "Stops by race", c("Race", "Total stops", "Race stops", "Race percent of all stops"), "pct_all")
+
+race_overall_plotly <- plot_ly(data = traffic_data_nodup_racecounts %>% race_prep, 
+        type = "bar", 
+        x = ~ race,
+        y = ~ freq,
+        color = ~ race,
+        showlegend = T,
+        text = ~ paste0("Percent: ", pct_all, "%")) %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Stops"),
+         title = "Stops by race")
+
+race_overall_plotly
+
+```
+
+
+**Stops of each racial group have declined significantly over time.** In 2015, police stopped `r pull_black_stops_2015_num %>% commafy` Black people and `r pull_hisp_stops_2015_num %>% commafy` Hispanic people, compared to `r pull_black_stops_2020_num %>% commafy` Black people and `r pull_hisp_stops_2020_num %>% commafy` Hispanic people in 2020. While relative stop-rates of Black people were less in 2020 than 2015--with Black people representing `r pull_black_stops_2015_pct`% of stops in 2015 and `r pull_black_stops_2020_pct`% in 2020--the decline corresponded with a higher portion of stops of Hispanic people, representing `r pull_hisp_stops_2015_pct`% of stops in 2015 and `r pull_hisp_stops_2020_pct`% in 2020. The proportion of white stops in 2015 and 2020 were about the same, representing `r pull_white_stops_2015_pct`% of stops in 2015 and `r pull_white_stops_2020_pct`% in 2020.
+
+```{r number of traffic stops per year plot}
+list_pop(traffic_stops_race, "Stops by race over time", new_names = c("Race", "Year", "Year-stops", "Race/year stops", "Race/year percent of stops in year"), "race_pct_year")
+
+# num by year
+sub_stops_race_year <- plot_ly(data = traffic_stops_race %>% race_prep,
+        x = ~ year,
+        y = ~ race_num,
+        name = ~ race,
+        legendgroup = ~ race,
+        color = ~ race,
+        type = "bar")  %>%
+  layout(title = "Traffic stops by race and year",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Percent of stops")) %>%
+  subplot_title("Total")
+  
+# pct by year
+sub_pct_race_year <- plot_ly(data = traffic_stops_race %>% race_prep,
+        x = ~ year,
+        y = ~ race_pct_year,
+        legendgroup = ~ race,
+        showlegend = FALSE,
+        color = ~ race,
+        type = "scatter",
+        mode = "line+marker") %>%
+  layout(title = "Traffic stops by race and year",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Percent of stops"))  %>%
+  subplot_title("Percent")
+
+subplot(sub_stops_race_year, 
+        sub_pct_race_year,
+        nrows = 2, shareX = TRUE)
+
+```
+
+```{r outcome race}
+# worst-outcome by race
+traffic_data_nodup_outcome_race <- traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  ungroup() %>%
+  # calcualte individual outcome totals
+  group_by(outcome) %>%
+  mutate(outcome_total = n()) %>%
+  # calculate race totals
+  group_by(race) %>%
+  mutate(race_total = n()) %>%
+  ungroup() %>%
+  group_by(race, outcome, total, outcome_total, race_total) %>%
+  # calculate race/outcome totals - as percent of race, and outcome total
+  summarize(race_outcome = n(),
+            race_pct = pct_round(race_outcome, race_total),
+            outcome_pct = pct_round(race_outcome, outcome_total),
+            outcome = factor(outcome, 
+                             c("Citation",
+                               "Repair Order",
+                               "Warning"),
+                             c("Citation",
+                               "Repair Order",
+                               "Warning"))) %>%
+  distinct() %>%
+  # filter out missing
+  filter(!is.na(race)) %>%
+  race_prep
+
+```
+
+## Stops by Outcome
+
+As a result of differences in stop-rates, Black people had the most stops ending in citations, warnings, and repair orders, followed by Hispanic people, and then white people.
+
+```{r outcome by race plot}
+
+list_pop(traffic_data_nodup_outcome_race, "Stops by race and worst-outcome", c("Race", "Outcome", "Total stops", "Worst-outcome stops",  "Race stops", "Race/worst-outcome stops", "Race/worst-outcome percent of race-stops", "Race/worst-outcome percent of worst-outcome stops"), c("race_pct", "outcome_pct"))
+
+# total outcomes by race
+plot_total_stop_race <- plot_ly(traffic_data_nodup_outcome_race,
+        x = ~ outcome,
+        y = ~ race_outcome,
+        color = ~ race,
+        type = "bar",
+        text = ~ paste0("Percent of outcome: ", outcome_pct, "%",
+                        "\nPercent of stops\nof racial-group: ", race_pct, "%")) %>%
+  layout(title = "Stops by worst-outcome and race", 
+         xaxis = list(title = "Outcome"), 
+         yaxis = list(title = "Number of stops"))
+
+# percent of outcomes by race
+plot_pct_stop_race <- plot_ly(traffic_data_nodup_outcome_race,
+        x = ~ race,
+        y = ~ race_pct,
+        color = ~ outcome,
+        type = "bar",
+        text = ~ paste0("Total: ", race_outcome)) %>%
+  layout(title = "Stop outcomes by race",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Percent"))
+  
+plot_total_stop_race
+
+```
+
+```{r outcomes race year over time}
+
+# calculate stops by race, outcome, and year
+traffic_data_nodup_outcome_race_year <- traffic_data_nodup %>%
+  group_by(year, outcome) %>%
+  # year/outcome total
+  mutate(total = n()) %>%
+  ungroup() %>%
+  # year/race total
+  group_by(year, race) %>%
+  mutate(race_total = n()) %>%
+  ungroup() %>%
+  # year/race/outcomes
+  group_by(year, race, outcome, total, race_total) %>%
+  summarize(race_outcome = n(),
+         race_pct = pct_round(race_outcome, total)) %>%
+  distinct() 
+
+# create dataset for overall results
+traffic_stops_race_merge <- traffic_stops_race %>%
+  mutate(outcome = "Overall") %>%
+  rename(total = year_total,
+         race_total = race_num,
+         race_outcome = race_num,
+         race_pct = race_pct_year)
+
+# bind overall results to dataset
+traffic_data_nodup_outcome_race_year <- traffic_data_nodup_outcome_race_year %>%
+  rbind(traffic_stops_race_merge) %>%
+  race_prep
+
+```
+
+There are not many notable trends in traffic stop outcomes by race over time.
+
+```{r outcomes race year over time plot}
+
+# populate list with dataset
+list_pop(traffic_data_nodup_outcome_race_year, "Stops by race and outcome over time", c("Year", "Race", "Worst-outcome", "Year/worst-outcome stops", "Year/race stops", "Year/race/worst-outcome stops", "Year/race/worst-outcome percent of year/worst-outcome stops"), "race_pct")
+
+# function to generate subplots for given race
+subplot_race_outcome_year <- function(race_string, showlegend = F){
+  # filter dataset to race and order worst-outcomes
+  df_use <- traffic_data_nodup_outcome_race_year %>%
+    filter(race == race_string) %>%
+    mutate(outcome = factor(outcome, c("Overall", "Citation", "Warning", "Repair Order"), c("Overall", "Citation", "Warning", "Repair Order")))
+  
+  # plot data
+  plot_ly(df_use, 
+          x = ~ year,
+          y = ~ race_pct,
+          color = ~ outcome,
+          name = ~ outcome,
+          showlegend = showlegend,
+          legendgroup = ~ outcome,
+          type = "scatter",
+          text = ~ paste0("Total stops: ", race_outcome %>% commafy),
+          mode = "line+marker") %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = "",
+                        range = c(10, 70))) %>%
+    subplot_title(title = race_string)
+}
+
+sub_black_outcome_year <- subplot_race_outcome_year("Black", T)
+sub_white_outcome_year <- subplot_race_outcome_year("White", F)
+sub_hisp_outcome_year <- subplot_race_outcome_year("Hispanic", F)
+
+subplot(sub_white_outcome_year,
+        sub_black_outcome_year, 
+        sub_hisp_outcome_year, shareX = T, shareY = TRUE, nrows = 1) %>%
+  layout(title = "Percent of all stop-worst-outcomes by race",
+         yaxis = list(title = "Percent of worst-outcomes"))
+
+```
+
+```{r number of resaons}
+# loop through each 
+num_reasons <- map2_dfr(c("num_violations", "num_citations", "num_warnings", "num_repair"), c("Violations overall", "Citations", "Warnings", "Repair"), ~ {
+  traffic_data_nodup %>%
+    # filter dataset to at least 1 instance of violation
+    filter(!!sym(.x) > 0) %>%
+    group_by(race) %>%
+    # exclude missing race
+    filter(!is.na(race)) %>%
+    # calculate violation totals for each race, and assign new variable for amount of violation per stop
+    summarize(total_stops = n(),
+              !!sym(.x) := sum(!!sym(.x)),
+              !!sym(.y) := !!sym(.x) / total_stops) %>%
+    distinct %>%
+    pivot_longer(c(.y)) 
+  }) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)),
+         name = factor(name, 
+                       c("Violations overall", "Citations", "Warnings", "Repair"),
+                       c("Violations overall", "Citations", "Warnings", "Repair"))) %>%
+  race_prep()
+
+# function to pull values for each
+pull_reasons <- function(race_val, viol_type){
+  num_reasons %>%
+    filter(race == race_val & name == viol_type) %>%
+    pull(value)
+}
+
+
+pull_reasons_avg_hisp <- pull_reasons("Hispanic", "Violations overall")
+
+pull_reasons_avg_black <- pull_reasons("Black", "Violations overall")
+
+pull_reasons_avg_white <- pull_reasons("White", "Violations overall")
+
+pull_citations_avg_hisp <- pull_reasons("Hispanic", "Citations")
+
+pull_citations_avg_black <- pull_reasons("Black", "Citations")
+
+pull_citations_avg_white <- pull_reasons("White", "Citations")
+
+
+```
+
+Police filed the most violations per stop for Hispanic people at `r pull_reasons_avg_hisp`, followed by Black people at `r pull_reasons_avg_black`; white people had the fewest at `r pull_reasons_avg_white`. Examining average numbers of violations by type involving stops with at least one outcome of that type (i.e., for citations, the average citations issued in stops involving at least one citation), Hispanic and Black people in particular were more likely to have multiple citations issued than white people. In stops involving at least one citation, police issued stopped Hispanic people an average of `r pull_citations_avg_hisp` citations per stop and Black people `r pull_citations_avg_black`, compared to `r pull_citations_avg_white` for white people.
+
+```{r number of reasons plot}
+# put totals in one column (instead of spread out wide)
+num_reasons_share <- num_reasons %>%
+  mutate(num_violations = ifelse(!is.na(num_violations), num_violations, case_when(name == "Citations" ~ num_citations,
+                                                                                   name == "Warnings" ~ num_warnings,
+                                                                                   name == "Repair" ~ num_repair,
+                                                                                   TRUE ~ 0))) %>%
+  select(-c(num_citations, num_warnings, num_repair)) %>%
+  select(race, name, total_stops, num_violations, value)
+
+list_pop(num_reasons_share, "Number of stop-outcomes by race", c("Race", "Outcome type", "Total stops of race involving stop-outcome", "Race/stop-outcome total", "Average stop outcome uses for race per stop involving outcome"), NULL)
+
+plot_ly(num_reasons_share %>%
+          filter(race != "Native American"), 
+        x = ~ name,
+        y = ~ value,
+        color = ~ race,
+        hovertext = ~ glue("Total violations of type: {num_violations %>% commafy}
+        Total stops involving violation: {total_stops %>% commafy}"),
+        name = ~ race,
+        type = "bar") %>%
+  layout(xaxis = list(title = "Violation type"),
+         yaxis = list(title = "Average violations per stop"),
+         title = "Average violations per stop by type and race in\nstops with at least one violation of that type")
+
+```
+
+*Note: Due to the low number of stops of Native Americans overall (38), averages for stopped Native Americans are omitted from the above chart.*
+
+```{r reasons race}
+
+# calculate uses of different reasons for stops
+traffic_data_race_reasons <- traffic_data_priority %>%
+  group_by(summary) %>%
+  mutate(summary_total = n()) %>%
+  group_by(race) %>%
+  mutate(race_total = n()) %>%
+  group_by(race, summary, race_total, summary_total) %>%
+  summarize(reason_year_num  = n(),
+            reason_year_pct = pct_round(reason_year_num, race_total),
+            reason_summary_pct= pct_round(reason_year_num, summary_total)) %>%
+  distinct() %>%
+  race_prep
+
+# identify where differences white
+reasons_white_pct <- traffic_data_race_reasons %>%
+  filter(race == "White") %>%
+  ungroup() %>%
+  select(summary, reason_year_pct) %>%
+  rename(pct_white = reason_year_pct)
+
+# join reasons used for stopped-white people to dataset, calculate difference/ratio
+traffic_data_race_reasons <- traffic_data_race_reasons %>%
+  left_join(reasons_white_pct, by = "summary") %>%
+  mutate(diff_white = reason_year_pct - pct_white,
+         ratio_white = round(reason_year_pct / pct_white, 1))
+
+# identify instances where uses of reason more than 10 times and percent difference greater than 2
+traffic_data_race_reasons_filter <- traffic_data_race_reasons %>%
+  filter(reason_year_num > 10 & abs(diff_white) > 2) %>%
+  pull(summary)
+
+# pull values - percentof reasons used for race and % of all uses of reason and total
+pull_white_stop_sign_pct <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_year_pct)
+
+pull_black_stop_sign_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_year_pct)
+
+pull_white_stop_sign_pct_all <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_summary_pct)
+
+pull_black_stop_sign_pct_all <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_summary_pct)
+
+pull_white_stop_sign_num <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_year_num)
+
+pull_black_stop_sign_num <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Special Stops Required", summary)) %>%
+  pull(reason_year_num)
+
+pull_black_seatbelt_num <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Required Security", summary)) %>%
+  pull(reason_year_num)
+
+pull_white_seatbelt_num <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+  pull(reason_year_num)
+
+pull_black_seatbelt_pct_all <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Required Security", summary)) %>%
+  pull(reason_summary_pct)
+
+pull_white_seatbelt_pct_all <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+  pull(reason_summary_pct)
+
+pull_black_seatbelt_ratio <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Required Security", summary)) %>%
+  pull(ratio_white)
+
+pull_white_seatbelt_ratio <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+  pull(ratio_white)
+
+# pull_hisp_insurance_num <- traffic_data_race_reasons %>%
+#   filter(grepl("Hispanic", race) & grepl("Required Security", summary)) %>%
+#   pull(reason_year_num)
+# 
+# pull_white_insurance_num <- traffic_data_race_reasons %>%
+#   filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+#   pull(reason_year_num)
+# 
+# pull_hisp_insurance_pct <- traffic_data_race_reasons %>%
+#   filter(grepl("Hispanic", race) & grepl("Required Security", summary)) %>%
+#   pull(reason_summary_pct)
+# 
+# pull_white_insurance_pct <- traffic_data_race_reasons %>%
+#   filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+#   pull(reason_summary_pct)
+# 
+# pull_hisp_insurance_ratio <- traffic_data_race_reasons %>%
+#   filter(grepl("Hispanic", race) & grepl("Required Security", summary)) %>%
+#   pull(ratio_white)
+# 
+# pull_white_insurance_ratio  <- traffic_data_race_reasons %>%
+#   filter(grepl("White", race) & grepl("Required Security", summary)) %>%
+#   pull(ratio_white)
+
+pull_white_license_pct <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Driver's License", summary)) %>%
+  pull(reason_year_pct)
+
+pull_hisp_license_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Hispanic", race) & grepl("Driver's License", summary)) %>%
+  pull(reason_year_pct)
+
+pull_black_license_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Driver's License", summary)) %>%
+  pull(reason_year_pct)
+
+
+pull_white_dui_pct <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Reckless, Negligent", summary)) %>%
+  pull(reason_year_pct)
+
+pull_hisp_dui_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Hispanic", race) & grepl("Reckless, Negligent, ", summary)) %>%
+  pull(reason_year_pct)
+
+pull_white_vehicle_pct <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Vehicle Equip", summary)) %>%
+  pull(reason_year_pct)
+
+pull_asian_vehicle_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Asian", race) & grepl("Vehicle Equip", summary)) %>%
+  pull(reason_year_pct)
+
+pull_other_vehicle_pct <- traffic_data_race_reasons %>%
+  filter(grepl("Other", race) & grepl("Vehicle Equip", summary)) %>%
+  pull(reason_year_pct)
+
+pull_black_titlereg <- traffic_data_race_reasons %>%
+  filter(grepl("Black", race) & grepl("Title and Registration", summary)) %>%
+  pull(reason_year_pct)
+
+pull_white_titlereg <- traffic_data_race_reasons %>%
+  filter(grepl("White", race) & grepl("Title and Registration", summary)) %>%
+  pull(reason_year_pct)
+
+
+```
+
+## Stop Reasons
+
+To identify potential differences in reasons for stops by race, we calculated the percentage of reasons people of each race were stopped, and then identified differences in that percentage from stops of white people. Below, we display the breakdown of reasons for stops by race for reasons that had:
+
+1) A greater than 2% difference between the percentage of stops for white people, and the percentage of stops for any other race. 
+
+2) More than 10 uses of the reason for any race.
+
+It is also worth noting that officers may cite multiple reasons for a stop, so the chart below shows differences in the percentage of times officers cited a reason in a stop, not differences in the percentage of stops for a reason.
+
+**This analysis shows seven reasons with higher rates of stops of people of color under these criteria: ** Stopped Hispanic people and Black people had a greater share of their stops for "Driver's License Issues," representing `r pull_hisp_license_pct`% of stop-reasons for Hispanic people and `r pull_black_license_pct`% of stop-reasons for Black people compared to `r pull_white_license_pct`% of stop-reasons for white people. Stopped Hispanic people also had a higher share of stops for "Reckless, Negligent, Aggressive, or Impaired Driving; Fleeing or Eluding", representing `r pull_hisp_dui_pct`% of stop-reasons for Hispanic people compared to `r pull_white_dui_pct`% of stop-reasons for white people. Stopped Black people also had a higher share of "Title and Registration" stop-reasons, representing `r pull_black_titlereg`% of reasons compared to `r pull_white_titlereg`% of reasons for white people.
+
+People of all races other than white were more likely to be stopped for "Lamps and Other Lighting Equipment", and Hispanic people more likely for "other equipment." Finally, `r pull_asian_vehicle_pct`% of reasons-used in stops of Asian people and `r pull_other_vehicle_pct`% of reasons-used in stops of people with a race of "other" were for "Vehicle Equipment Repair Order," compared to `r pull_white_vehicle_pct`% of white people.
+
+```{r reasons race plot}
+
+list_pop(traffic_data_race_reasons, 
+         "Stop-reasons by race", 
+         c("Race", 
+           "Stop reason",
+           "Race violations total (all stop-reasons)",
+           "Stop-reason total",
+           "Race/stop-reason total",
+           "Race/reason uses as percent of all violations for race",
+           "Race/reason uses as percent of all uses of reason",
+           "Percent of uses of reason for stopped white people",
+           "Difference in percent of uses of reason for race with stopped white people",
+           "Ratio of percent of uses of reason for race to percent of uses for stopped white people"),
+         c("reason_year_pct",
+           "reason_summary_pct",
+           "pct_white",
+           "diff_white"))
+
+# automobile use tp
+plot_ly(traffic_data_race_reasons %>%
+          # filter to stops meeting described criteria =
+          filter(summary %in% traffic_data_race_reasons_filter & race != "Native American") %>%
+          race_prep %>%
+          # try to reformat slightly for visual purposes
+  mutate(summary = case_when(grepl("Reckless, Negligent", summary) ~ "Reckless, Negligent, Aggressive,\nor Impaired Driving;\nFleeing or Eluding",
+                             grepl("Lamps and Other Lighting Equipment", summary) ~ "Lamps and Other\nLighting Equipment",
+                             grepl("Vehicle Equipment Repair Order", summary) ~ "Vehicle Equipment\nRepair Order",
+         TRUE ~ summary)),
+        x = ~ summary,
+        y = ~ reason_year_pct,
+        color = ~ race,
+        text = ~ paste0("Number of uses for race: ", reason_year_num %>% commafy,
+                        "\nPercent of all uses by race: ", reason_summary_pct, "%"),
+        
+        name = ~race) %>%
+  layout(yaxis = list(title = "Percent of reasons for race"),
+         xaxis = list(title = "Reason"),
+         title = "Reasons for stop with greater than 2% difference\nin use of reasons between white and other races")
+
+```
+
+*Note: Stops of Native Americans are excluded from the above chart because the low number of stops of Native Americans makes the percentages potentially misleading. The chart is limited to stop-reasons with at least 10 uses for a race.*
+
+## Race by Gender
+
+```{r race gender}
+
+# group by race and gender
+race_gender <- traffic_data_nodup %>%
+  # filter out unknown/missing values
+  filter(gender != "Unknown" & !is.na(gender)) %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(race) %>%
+  mutate(race_total = n()) %>%
+  group_by(gender) %>%
+  mutate(gender_total = n()) %>%
+  group_by(race, gender, total, race_total, gender_total) %>%
+  summarise(race_gender_total = n(),
+            race_gender_pct_all = pct_round(race_gender_total, total),
+            race_gender_pct_gender = pct_round(race_gender_total, gender_total),
+            race_gender_pct_race = pct_round(race_gender_total, race_total)) %>%
+  distinct() %>%
+  race_prep
+
+# nrow(traffic_data_nodup) - sum(race_gender$race_gender_total)
+# summary(as.factor(traffic_data_nodup$gender))
+
+pull_race_men_black_pct <- race_gender %>%
+  filter(race == "Black" & gender == "Man") %>%
+  pull(race_gender_pct_gender)
+
+
+pull_race_men_hisp_pct <- race_gender %>%
+  filter(race == "Hispanic" & gender == "Man") %>%
+  pull(race_gender_pct_gender)
+
+pull_race_women_hisp_pct <- race_gender %>%
+  filter(race == "Hispanic" & gender == "Woman") %>%
+  pull(race_gender_pct_gender)
+
+pull_race_men_white_pct <- race_gender %>%
+  filter(race == "White" & gender == "Man") %>%
+  pull(race_gender_pct_gender)
+
+pull_race_women_white_pct <- race_gender %>%
+  filter(race == "White" & gender == "Woman") %>%
+  pull(race_gender_pct_gender)
+
+pull_race_women_black_pct <- race_gender %>%
+  filter(race == "Black" & gender == "Woman") %>%
+  pull(race_gender_pct_gender)
+
+# identify numberof unknown
+race_gender_unknown <- traffic_data_nodup %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  filter(gender == "Unknown" | is.na(gender)) %>%
+  group_by(total, gender) %>%
+  summarize(total_unk = n(),
+            pct_all = pct_round(total_unk, total)) %>%
+  distinct
+
+pull_race_gender_unknown_num <- pull(race_gender_unknown, total_unk) %>%
+  sum()
+
+```
+
+**Racial disparities do not vary substantially within genders,** except that stops of Hispanic people represented `r pull_race_men_hisp_pct`% of stops of all men compared to `r pull_race_women_hisp_pct`% of stops of women, and stops of white people represented `r pull_race_women_white_pct`% of stops of women compared to `r pull_race_men_white_pct`% of stops of men.
+
+```{r plot race gender}
+list_pop(race_gender, 
+         "Stops by race and gender",
+         c("Race",
+           "Gender",
+           "Total stops",
+           "Race stops",
+           "Gender stops",
+           "Race/gender stops",
+           "Race/gender percent of all stops",
+           "Race/gender percent of stops of gender",
+           "Race/gender percent of stops of race"),
+         c("race_gender_pct_all",
+           "race_gender_pct_gender",
+           "race_gender_pct_race"))
+
+
+sub_race_gender_num <- plot_ly(race_gender, 
+        x = ~ gender,
+        y = ~ race_gender_total,
+        color = ~ race,
+        legendgroup = ~ race,
+        name = ~ race,
+        showlegend = F,
+        text = ~ paste0("Percent of gender: ", race_gender_pct_gender, "%",
+                        "\nPercent of all stops: ", race_gender_pct_all, "%")) %>%
+  layout(title = "",
+         xaxis = list(title = ""),
+         yaxis = list(title = "")) %>%
+  subplot_title("Total")
+
+sub_race_gender_pct <- plot_ly(race_gender, 
+        x = ~ gender,
+        y = ~ race_gender_pct_gender,
+        color = ~ race,
+        legendgroup = ~ race,
+        name = ~ race,
+        text = ~ paste0("Race/gender total: ",  race_gender_total %>% commafy,
+                        "\nPercent of all stops: ", race_gender_pct_all, "%")) %>%
+  layout(title = "Race by gender",
+         xaxis = list(title = ""),
+         yaxis = list(title = "")) %>%
+  subplot_title("Percent of stops of gender")
+
+subplot(sub_race_gender_num, sub_race_gender_pct, nrows = 2, shareX = T) %>%
+  layout(title = "Stops by race and gender")
+
+
+```
+*Note: The chart above excludes `r pull_race_gender_unknown_num  %>% commafy` stops with an unknown gender, representing less than 0.1% of stops.*
+
+## Race by Age
+
+```{r race by age by gender}
+
+# calculate stops by race/age
+stops_race_age <- traffic_data_nodup %>%
+  filter(age_range != "Missing") %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(race) %>%
+  mutate(race_total = n()) %>%
+  group_by(age_range) %>%
+  mutate(age_total = n()) %>%
+  group_by(race, age_range, total, race_total, age_total) %>%
+  summarize(age_race_total = n(),
+            age_race_pct_all = pct_round(age_race_total, total),
+            age_race_pct_age = pct_round(age_race_total, age_total),
+            age_race_pct_race = pct_round(age_race_total, race_total)) %>%
+  distinct() %>%
+  race_prep
+
+# pull values
+pull_stops_15_19 <- stops_race_age %>%
+  filter(age_range == "15-19") %>%
+  pull(age_total) %>%
+  unique()
+
+pull_tot_stops <- stops_race_age %>%
+  pull(total) %>%
+  unique()
+
+pull_pct_stops_15_19 <- pct_round(pull_stops_15_19, pull_tot_stops)
+
+# pull range for stopped black people 20+
+pull_range_age_black_pct <- stops_race_age %>%
+  filter(race == "Black" & age_range != "15-19") %>%
+  pull(age_race_pct_age) %>%
+  range()
+
+# pull range for stopped hispanic people 15 to 49
+pull_range_age_hisp_pct <- stops_race_age %>%
+  filter(race == "Hispanic" & age_range %in% unique_age_original[1:4]) %>%
+  pull(age_race_pct_age) %>%
+  range()
+
+```
+
+**Differences in stop-rates by race show up across age groups.** In all age-groups except ages 15-19--representing just `r pull_pct_stops_15_19`% of all stops--Black people were stopped by police between `r pull_range_age_black_pct[1]`% and `r pull_range_age_black_pct[2]`% of all stops of the age group, similar to the overall percentage of stops of Black people of `r pull_black_stops_pct`%. Police were especially likely to stop Hispanic people in age groups between 15 and 49; the overall percentage of stops of Hispanic people was `r pull_hispanic_stops_pct`%, and stops in these age groups ranged between `r pull_range_age_hisp_pct[1]`% and `r pull_range_age_hisp_pct[2]`%.
+
+```{r race age plot}
+list_pop(stops_race_age, 
+         "Stops by race and age",
+         c("Race",
+           "Age range",
+           "Total stops",
+           "Race stops",
+           "Age group stops",
+           "Race/age stops",
+           "Race/age percent of all stops",
+           "Race/age percent of age group stops",
+           "Race/age percent of stops of race"),
+         c("age_race_pct_all", "age_race_pct_age", "age_race_pct_race"))
+
+
+plot_ly(stops_race_age,
+        x = ~ age_range,
+        y = ~ age_race_total,
+        text = ~ paste0("Percent of all stops: ", age_race_pct_all, "%",
+                        "\nPercent of age-group stops: ", age_race_pct_age, "%",
+                        "\nPercent of racial-group stops: ", age_race_pct_race, "%"),
+        color = ~ race,
+        name = ~ race) %>%
+  layout(xaxis = list(title = "Age range"),
+         yaxis = list(title = "Stops"),
+         title = "Stops by race and age")
+
+
+```
+
+*Note: There were `r num_stops_missing  %>% commafy` age values that were miscoded in the data (over 100 or under 15, some of which were negative), and they are excluded from the above chart.*
+
+## Stops by Race, Age, and Gender
+
+```{r race by age gender}
+
+stops_race_age_gender <- traffic_data_nodup %>%
+  filter(!(age_range %in% c("Missing"))) %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(race) %>%
+  mutate(race_total = n()) %>%
+  group_by(age_range) %>%
+  mutate(age_total = n()) %>%
+  group_by(gender) %>%
+  mutate(gender_total = n()) %>%
+  # calculate age/gender totals and race/gender totals
+  group_by(age_total, gender) %>%
+  mutate(age_gender_total = n()) %>%
+  group_by(race, gender) %>%
+  mutate(race_gender_total = n()) %>%
+  # calculate race age and gender totals and %s
+  group_by(race, age_range, gender, total, race_total, age_total, gender_total, age_gender_total) %>%
+  summarize(race_age_gender = n(),
+            pct_age_gender_total = pct_round(race_age_gender, age_gender_total),
+            pct_all_stops = pct_round(race_age_gender, total),
+            pct_race_gender_stops = pct_round(race_age_gender, race_gender_total),
+            pct_race_stops = pct_round(race_age_gender, race_total)) %>%
+  distinct() %>%
+  race_prep
+
+```
+
+**Differences in stops by race hold after breaking the data out by race, age, and gender.** Police stopped Black men aged 20-39 and then Hispanic men aged 20-39 the most among any combination of age, race/ethnicity, and gender groups. Police stopped Black women aged 20-39 the most of any age/race combination among women, and more than any age/gender combination of white people.
+
+```{r race by age gender plot}
+list_pop(stops_race_age_gender, 
+         "Stops by race, age, and gender",
+         c("Race", "Age group", "Gender", "Total stops", "Race stops", "Age group stops", "Gender stops", "Age/gender stops", "Race/age/gender stops", "Race/age/gender percent of stops of age/gender", "Race/age/gender percent of all stops", "Race/age/gender percent of stops of race/gender", "Race/age/gender percent of stops of race"),
+         c("pct_age_gender_total", "pct_all_stops", "pct_race_gender_stops", "pct_race_stops"))
+
+# function to generate subplots
+race_gender_funct <- function(gender_val, sub_name, showlegend = F){
+  # filter data to supplied gender and generate plo
+  plot_ly(stops_race_age_gender %>%
+            filter(gender == gender_val),
+          x = ~ age_range,
+          y = ~ race_age_gender,
+          showlegend = showlegend,
+          text = ~ paste0("Percent of all stops: ", pct_all_stops, "%",
+                          "\nPercent of racial-group stops: ", pct_race_stops, "%",
+                          "\nPercent of race/gender group stops: ", pct_race_gender_stops, "%",
+            "\nPercent of age/gender group stops: ", pct_age_gender_total, "%"),
+          color = ~ race,
+          legendgroup = ~ race,
+            name = ~ race) %>%
+    layout(xaxis = list(title = ""),
+           yaxis = list(title = ""),
+           title = "") %>%
+    subplot_title(sub_name)
+}
+
+sub_men_race_age <- race_gender_funct("Man", "Men", T)
+
+sub_women_race_age <- race_gender_funct("Woman", "Women")
+
+subplot(sub_men_race_age, sub_women_race_age, shareX = T, shareY = TRUE) %>%
+  layout(title = "Stops by race, age, and gender",
+         yaxis = list(title = "Total stops"))
+
+```
+
+**Within genders, differences in stop rates by race between white people and other races are highest among men, and highest in the earlier-spectrum of age groups.** White women represent a higher share of stops of women across the age spectrum than white men. Within genders, Black women are stopped at a similar rate as Black men up until 40-49, and then decline as a share of stops of women while Black men occupy a similar share at increasing ages. Hispanic men are consistently stopped as a higher share of men than Hispanic women across the age spectrum, and are stopped especially more often earlier in the age-group spectrum.
+
+```{r sub race age gender pct plot}
+# subplot function
+sub_race_gender_age <- function(race_string, showlegend = F){
+  plot_ly(stops_race_age_gender %>%
+            filter(race == race_string & gender != "Unknown") %>%
+            # recode age so shorter
+            mutate(age_range = ifelse(grepl("70 or higher", age_range), "70+", age_range)),
+          x = ~ age_range,
+          color = ~ gender,
+          showlegend = showlegend,
+          legendgroup = ~ gender,
+          name = ~ gender,
+          text = ~ paste0("Total stops: ", race_age_gender,
+                          "\nPercent of all stops: ", pct_all_stops, "%",
+                          "\nPercent of racial-group stops: ", pct_race_stops, "%",
+                          "\nPercent of race/gender group stops: ", pct_race_gender_stops, "%"),
+          y = ~ pct_age_gender_total) %>%
+    layout(xaxis = list(title = ""),
+               yaxis = list(title = ""),
+               title = "") %>%
+    subplot_title(race_string)
+}
+
+sub_black_agegender <- sub_race_gender_age("Black", T)
+sub_hisp_agegender <- sub_race_gender_age("Hispanic", F)
+sub_white_agegender <- sub_race_gender_age("White", F)
+
+subplot(sub_black_agegender, sub_hisp_agegender, sub_white_agegender, nrows = 1, shareX = T, shareY = T) %>%
+  layout(yaxis = list(title = "Percent of stops for age/gender group"),
+         title = "Percent of age/gender-stops by race",
+         xaxis = list(title = "Age-range"))
+
+
+```
+
+# Computer Aided Dispatch (CAD) Data
+
+```{r cad}
+# reformat type for html
+cad_data_asdata <- cad_data_asdata %>%
+  mutate(type = ifelse(grepl("Parking ", type), "Parking Problem/\nMotorist Assist", type))
+
+# function to pull totals for cad in a given year
+pull_cad_vals <- function(col_val = 2020, col = "year"){
+  cad_data_asdata %>%
+    filter(grepl(col_val, !!sym(col))) %>%
+    nrow()
+}
+
+pull_cad_2020 <- pull_cad_vals()
+
+pull_cad_2019 <- pull_cad_vals(2019)
+
+pull_cad_2018 <- pull_cad_vals(2018)
+
+# function to pull traffic stops in different years
+year_stops_funct <- function(year_val){
+  cad_data_asdata %>%
+    filter(year == year_val & type == "Traffic Stop") %>%
+    nrow
+}
+
+pull_cad_stops_2018 <- year_stops_funct(2018)
+pull_cad_stops_2019 <- year_stops_funct(2019)
+pull_cad_stops_2020 <- year_stops_funct(2020)
+
+
+# pull total stops, motorist assist, and accident incidents
+pull_cad_stops <- pull_cad_vals("Traffic Stop", "type")
+
+pull_cad_assist <- pull_cad_vals("Assist", "type")
+
+pull_cad_accident <- pull_cad_vals("Accident - Injury", "type")
+
+# calculate incidents as % of total
+cad_incidents <- cad_data_asdata %>%
+  group_by() %>%
+  mutate(total = n()) %>%
+  group_by(type, total) %>%
+  summarize(type_total = n(), 
+            pct_type = pct_round(type_total, total)) %>%
+  distinct
+
+# pull % values for each stop type
+pull_cad_stops_pct <- cad_incidents %>%
+  filter(grepl("Stop", type)) %>%
+  pull(pct_type)
+
+pull_cad_assist_pct <- cad_incidents %>%
+  filter(grepl("Assist", type)) %>%
+  pull(pct_type)
+
+pull_cad_accident_pct <- cad_incidents %>%
+  filter(grepl("Accident", type)) %>%
+  pull(pct_type)
+
+
+
+```
+
+Below, we visualize data on CAD calls in each year, and by each type. Between 2018-2020, there were `r sum(cad_incidents$type_total) %>% commafy` calls to CAD dispatchers about traffic incidents. As discussed in the introduction, it should be noted there is a mismatch between the number of stops in the traffic stops data, and the number of incidents with the type "traffic stop" in the CAD data.
+
+**Across the three years of available data, traffic stops were the most frequent incident dispatchers coded at `r pull_cad_stops %>% commafy` incidents--representing `r pull_cad_stops_pct`% of incidents--followed by parking problems/motorist assistance incidents at `r pull_cad_assist %>% commafy` incidents.** There were only `r pull_cad_accident %>% commafy` accident incidents in the dispatcher-call system across the three years of data, representing `r pull_cad_accident_pct`% of incidents.
+
+```{r cad incidents plot}
+
+list_pop(cad_incidents, "CAD incidents by type", c("Incident type", "Total incidents", "Type incident total", "Type percent of all incidents"), "pct_type")
+
+plot_ly(cad_incidents,
+        values = ~ type_total,
+        labels = ~ type,
+                textposition = "inside",
+        textinfo = "label+percent",
+
+        type = "pie",
+        hole = 0.4) %>%
+  layout(title = "Dispatcher incidents 2018-2020")
+
+```
+
+```{r cad incidents over time}
+
+# calculate year by year incidents
+cad_incidents_year <- cad_data_asdata %>%
+  group_by(year) %>%
+  mutate(total = n()) %>%
+  group_by(type, year, total) %>%
+  summarize(type_total = n(), 
+            pct_type = pct_round(type_total, total)) %>%
+  distinct
+
+# function to pull data from incidents by year
+cad_incidents_year_pull <- function(type_val, 
+                                    year_val, 
+                                    col_pull){
+  cad_incidents_year %>%
+    filter(year == year_val & grepl(type_val, type)) %>%
+    pull(!!sym(col_pull))
+}
+
+# pull data each year
+pull_cad_stops_2018 <- cad_incidents_year_pull("Stop", 2018, "type_total")
+
+pull_cad_stops_2020 <- cad_incidents_year_pull("Stop", 2020, "type_total")
+
+pull_cad_assist_2018 <- cad_incidents_year_pull("Assist", 2018, "type_total")
+
+pull_cad_assist_2020 <- cad_incidents_year_pull("Assist", 2020, "type_total")
+
+```
+
+Both traffic stop and parking problem/motorist assist incidents declined in the dispatcher-assist system since 2018; traffic stops from `r pull_cad_stops_2018 %>% commafy` incidents in 2018 to `r pull_cad_stops_2020 %>% commafy` in 2020, and parking problem/motorist assist incidents declined from `r pull_cad_assist_2018 %>% commafy` incidents in 2018 to `r pull_cad_assist_2020 %>% commafy` incidents in 2020.
+
+```{r cad plot}
+list_pop(cad_incidents_year, "CAD incidents by type over time", c("Incident type", "Year", "Year incident total", "Year/type incident total", "Year/type percent of year incidents"), "pct_type")
+
+# write list of summary datasets
+write_rds(dfs_list, "./data/output/stops_dfs_list.rds")
+
+# plot data
+plot_ly(cad_incidents_year, 
+        x = ~ year,
+        y = ~ type_total,
+        color = ~ type,
+        name = ~ type,
+        text = ~ paste0("Percent year total: ", pct_type, "%"),
+        type = "scatter",
+        mode = "line+marker") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Total incidents"),
+         title = "Dispatcher incidents over time")
+
+```
+
+**Below, we provide an interactive map of all incidents appearing in the CAD system, broken out by type and year.** Incidents are automatically clustered by the frequency of incidents as you zoom in and out. Mousing over a cluster will show the geography covered by the cluster. You can also click on clusters to automatically break them up and zoom in. When you get to the smallest cluster (e.g., multiple stops at the same spot), clicking on the cluster will break it up into each incident. Mousing over an incident will provide a set of descriptive information about the incident, including the date and beat of a responding officer. You can turn layers on and off by clicking the box next to them.
+
+In `r nrow(cad_dups)  %>% commafy` cases, multiple officers were involved in an incident.
+
+```{r cad leaflet}
+# write summary dataframes for dashboard
+write_rds(dfs_list, "./data/stops_dfs_list.rds")
+
+# define common labels
+labels_funct <- function(df_as_data){
+  map(seq(nrow(df_as_data)), function(i){
+    return(paste0(
+      "Date/time: ", df_as_data[i, "received_char"], "<p></p>",
+      "Type: ", df_as_data[i, "type"], "<p></p>",
+      "Officer beat: ", df_as_data[i, "beat"],"<p></p>",
+      "Year: ", df_as_data[i, "year"]))
+  })
+}
+
+### standard function to add a type points layer
+addpoints_standard <- function(basemap,  
+                             df, 
+                             # pal_funct,
+                             filter_val,
+                             filter_col = "type"){
+  
+  # filter dataset based on number of filter columns provided
+  if (length(filter_col) == 1){
+    df <- df %>%
+      filter(!!sym(filter_col) == filter_val)
+    
+    group_val <- paste0(str_to_title(filter_col), ": ", filter_val)
+
+  }
+  
+  if (length(filter_col) == 2){
+    df <- df %>%
+      filter(!!sym(filter_col[1]) == filter_val[1] & !!sym(filter_col[2]) == filter_val[2])
+    
+    # define group name
+    group_val <- paste0(filter_val[1], ": ", filter_val[2])
+  }
+
+  if (length(filter_col)  > 2){
+    stop("error; only prepared to deal with 2 filter columns")
+  }
+  
+  # create labels from filtered dataset
+  label_vals <- labels_funct(df %>% st_drop_geometry())
+  
+  
+  if (!exists("overlays")){
+    overlays <- c()
+  }
+  
+  # create vector for overlay group names
+  overlays <<- c(overlays, group_val)
+  
+  # add cluster layer to supplied basemap
+  basemap %>%
+    addMarkers(clusterOptions = markerClusterOptions(), 
+               group = group_val,
+               label = map(label_vals, htmltools::HTML), 
+               labelOptions = labelOptions(style =list("font-weight" = "normal", 
+                                       padding = "1px 1px"),
+                          textsize = "11px",
+                          direction = "auto",
+                          opacity = 0.8),
+               data = df)
+  
+
+}
+
+# function to add ward boundaries
+add_wards <- function(basemap){
+  basemap %>%
+    addPolygons(data = ward_boundaries, 
+                fill = FALSE,
+                # smoothFactor = 0.5,
+                weight = 1.5,
+                opacity = 1,
+                color = "#646464", 
+                label = ~ str_to_title(WARD), 
+                # options = pathOptions(pane = "borders"),
+                labelOptions = labelOptions(noHide = TRUE, 
+                                            direction = 'top', 
+                                            textOnly = TRUE, 
+                                            style = list("font-weight" = "bold", padding = "1px 1px"),
+                                            textsize = "11px"))
+}
+
+# function to generate map
+map_gen <- function(){
+  
+  # empty overlay group
+  overlays <<- c()
+  
+  leaflet() %>%
+    addTiles() %>%
+    # add layers each year/type of incident
+    addpoints_standard(df = cad_data_sf, filter_val = c(2018, "Parking Problem / Motorist Assist"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2018, "Accident - Injury"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2018, "Traffic Stop"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2019, "Parking Problem / Motorist Assist"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2019, "Accident - Injury"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2019, "Traffic Stop"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2020, "Parking Problem / Motorist Assist"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2020, "Accident - Injury"), filter_col = c("year", "type")) %>%
+    addpoints_standard(df = cad_data_sf, filter_val = c(2020, "Traffic Stop"), filter_col = c("year", "type")) %>%
+    # add overall layers
+    addpoints_standard(df = cad_data_sf, filter_val = "Parking Problem / Motorist Assist") %>%
+    addpoints_standard(cad_data_sf, "Accident - Injury") %>%
+        addpoints_standard(df = cad_data_sf, filter_val = "Traffic Stop") %>%
+    addLayersControl(overlayGroups = overlays,
+                     options = layersControlOptions(collapsed = T))  %>%
+    hideGroup(overlays[-1]) %>%
+    add_wards
+}
+  
+cad_map <- map_gen()
+cad_map
+
+```
+

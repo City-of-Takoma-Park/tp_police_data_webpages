@@ -48,6 +48,8 @@ datasets_share - datasets to share on the city webpage, including data dictionar
 
 report_share - word versions of each webpage
 
+renv - packages used to build webpages
+
 processing - code to process internal police arrest/traffic stops/computer-assisted dispatch data
 
 webpages_scattered - code to produce two RMarkdown HTML documents and two dashboards visualizing arrest/stops data
